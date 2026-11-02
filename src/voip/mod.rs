@@ -30,6 +30,7 @@ pub use facade::{
     AcceptCall, CallHandle, CallLinkCall, GroupBoundCall, OutgoingCall, OutgoingGroupCall,
     RelayTransportMaker,
 };
+pub use transport::UdpConnMaker;
 pub use video::{VideoFrame, VideoSink, VideoSource};
 // Surface core types carried by the facade next to the builders and handle that expose them.
 pub use wacore::voip::{

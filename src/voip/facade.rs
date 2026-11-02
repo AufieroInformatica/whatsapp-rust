@@ -46,7 +46,7 @@ use crate::voip::audio::{
     AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
 };
 use crate::voip::driver::{RandTxIds, run_call_tokio};
-use crate::voip::transport::RelayMediaChannelFactory;
+use crate::voip::transport::{RelayMediaChannelFactory, UdpConnMaker};
 use crate::voip::video::{VideoSink, VideoSource};
 
 enum AudioEndpoints {
@@ -82,11 +82,17 @@ pub type RelayTransportMaker =
 fn relay_factory(
     client: &Client,
     maker: Option<&RelayTransportMaker>,
+    udp: Option<&UdpConnMaker>,
     addr: SocketAddr,
 ) -> Arc<dyn RelayTransportFactory> {
-    match maker {
-        Some(maker) => maker(addr),
-        None => Arc::new(RelayMediaChannelFactory::new(addr, client.runtime.clone())),
+    match (maker, udp) {
+        (Some(maker), _) => maker(addr),
+        (None, Some(udp)) => Arc::new(RelayMediaChannelFactory::with_udp(
+            addr,
+            client.runtime.clone(),
+            udp.clone(),
+        )),
+        (None, None) => Arc::new(RelayMediaChannelFactory::new(addr, client.runtime.clone())),
     }
 }
 
@@ -138,6 +144,14 @@ macro_rules! impl_media_builder_methods {
             self.relay_transport = Some(maker);
             self
         }
+
+        /// Carry the built-in DTLS/SCTP/DataChannel relay stack over a UDP socket of your own, e.g. a
+        /// SOCKS5 UDP association, instead of a bare OS socket. `maker` is called with the relay
+        /// endpoint and returns a `Conn` already connected to it. Ignored when `relay_transport` is set.
+        pub fn relay_udp(mut self, maker: UdpConnMaker) -> Self {
+            self.relay_udp = Some(maker);
+            self
+        }
     };
 }
 
@@ -151,6 +165,7 @@ pub struct AcceptCall<'a> {
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
 }
 
 async fn wait_for_group_relay(
@@ -181,6 +196,7 @@ impl<'a> AcceptCall<'a> {
             audio: None,
             video: None,
             relay_transport: None,
+            relay_udp: None,
         }
     }
 
@@ -358,7 +374,12 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = relay_factory(self.client, self.relay_transport.as_ref(), addr);
+        let factory = relay_factory(
+            self.client,
+            self.relay_transport.as_ref(),
+            self.relay_udp.as_ref(),
+            addr,
+        );
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
@@ -500,6 +521,7 @@ pub struct OutgoingCall<'a> {
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
 }
 
 impl<'a> OutgoingCall<'a> {
@@ -510,6 +532,7 @@ impl<'a> OutgoingCall<'a> {
             audio: None,
             video: None,
             relay_transport: None,
+            relay_udp: None,
         }
     }
 
@@ -654,6 +677,7 @@ impl<'a> OutgoingCall<'a> {
             audio,
             video,
             self.relay_transport.take(),
+            self.relay_udp.take(),
         )
         .await
     }
@@ -668,6 +692,7 @@ pub struct OutgoingGroupCall<'a> {
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
 }
 
 impl<'a> OutgoingGroupCall<'a> {
@@ -680,6 +705,7 @@ impl<'a> OutgoingGroupCall<'a> {
             audio: None,
             video: None,
             relay_transport: None,
+            relay_udp: None,
         }
     }
 
@@ -941,7 +967,12 @@ impl<'a> OutgoingGroupCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = relay_factory(self.client, self.relay_transport.as_ref(), addr);
+        let factory = relay_factory(
+            self.client,
+            self.relay_transport.as_ref(),
+            self.relay_udp.as_ref(),
+            addr,
+        );
         let handle =
             spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
@@ -958,6 +989,7 @@ pub struct GroupBoundCall<'a> {
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
 }
 
 impl<'a> GroupBoundCall<'a> {
@@ -968,6 +1000,7 @@ impl<'a> GroupBoundCall<'a> {
             audio: None,
             video: None,
             relay_transport: None,
+            relay_udp: None,
         }
     }
 
@@ -997,6 +1030,7 @@ impl<'a> GroupBoundCall<'a> {
             audio: self.audio.take(),
             video: self.video.take(),
             relay_transport: self.relay_transport.take(),
+            relay_udp: self.relay_udp.take(),
         }
         .start()
         .await
@@ -1015,6 +1049,7 @@ pub struct CallLinkCall<'a> {
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
 }
 
 impl<'a> CallLinkCall<'a> {
@@ -1026,6 +1061,7 @@ impl<'a> CallLinkCall<'a> {
             audio: None,
             video: None,
             relay_transport: None,
+            relay_udp: None,
         }
     }
 
@@ -1140,7 +1176,12 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = relay_factory(self.client, self.relay_transport.as_ref(), addr);
+        let factory = relay_factory(
+            self.client,
+            self.relay_transport.as_ref(),
+            self.relay_udp.as_ref(),
+            addr,
+        );
         let handle =
             spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
@@ -1645,6 +1686,7 @@ async fn place_call(
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
 ) -> Result<CallHandle, CallError> {
     // The offer keeps the addressed `<destination><to jid>` shape whenever the callee is multi-device
     // (computed before any pkmsg/encrypt filtering), even if one encryptable survivor remains.
@@ -1847,6 +1889,7 @@ async fn place_call(
                 ended: ended.clone(),
                 ev_tx,
                 relay_transport,
+                relay_udp,
                 rekey_rx,
             },
         );
@@ -2052,6 +2095,7 @@ pub(crate) struct PendingOutgoing {
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
     relay_transport: Option<RelayTransportMaker>,
+    relay_udp: Option<UdpConnMaker>,
     /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
     /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
     rekey_rx: async_channel::Receiver<String>,
@@ -2119,7 +2163,12 @@ pub(crate) async fn attach_outgoing_relay(
             .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok::<_, CallError>((
             engine,
-            relay_factory(client, pending.relay_transport.as_ref(), addr),
+            relay_factory(
+                client,
+                pending.relay_transport.as_ref(),
+                pending.relay_udp.as_ref(),
+                addr,
+            ),
         ))
     })();
     let (engine, factory) = match build {
@@ -5723,6 +5772,7 @@ mod tests {
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
             None,
+            None,
         )
         .await
         .expect("place_call");
@@ -5842,6 +5892,7 @@ mod tests {
             &devices,
             &devices,
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
             None,
         )
@@ -6254,6 +6305,7 @@ mod tests {
             encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
             None,
+            None,
         )
         .await
         .expect("place encoded call");
@@ -6327,6 +6379,7 @@ mod tests {
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
             None,
+            None,
         )
         .await
         .expect("place_call");
@@ -6379,6 +6432,7 @@ mod tests {
             &[good0.clone(), good1.clone(), bad.clone()],
             &[good0.clone(), good1.clone(), bad.clone()],
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
             None,
         )
@@ -6452,6 +6506,7 @@ mod tests {
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
             None,
         )
@@ -6646,6 +6701,7 @@ mod tests {
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             video,
             relay_transport,
+            None,
         )
         .await
         .expect("place_call");
@@ -7951,6 +8007,7 @@ mod tests {
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -8116,6 +8173,7 @@ mod tests {
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
             None,
         )
