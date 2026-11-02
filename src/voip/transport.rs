@@ -100,6 +100,9 @@ pub struct RelayMediaChannel {
     /// Portable runtime handle (not `tokio::spawn`) so `Drop` can spawn the off-task association
     /// close without binding this transport to a specific runtime, matching the sans-IO seam.
     runtime: Arc<dyn Runtime>,
+    /// The app's UDP maker, kept so a relay reconnect dials through the same leg instead of
+    /// silently falling back to a bare socket.
+    udp: Option<UdpConnMaker>,
 }
 
 impl RelayMediaChannel {
@@ -146,24 +149,43 @@ fn install_default_crypto_provider() {
     });
 }
 
+/// Builds the UDP leg the relay DTLS client runs over, for a given relay endpoint. The returned
+/// `Conn` must already be connected to that endpoint (datagrams in and out are the relay's only).
+/// Lets an app carry the unchanged DTLS/SCTP/DataChannel stack over a socket of its own, e.g. a
+/// SOCKS5 UDP association, instead of a bare OS socket.
+pub type UdpConnMaker = Arc<
+    dyn Fn(
+            SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn Conn011 + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The multi-step setup is kept on `anyhow` for per-step `.context()`; the factory wraps the
 /// aggregate (a connect failure is fatal for the call).
 pub async fn connect_relay_media(
     relay_addr: SocketAddr,
     runtime: Arc<dyn Runtime>,
+    udp_maker: Option<&UdpConnMaker>,
 ) -> Result<RelayMediaChannel> {
-    // 1. UDP socket connected to the relay. Bind in the relay's address family so an IPv6 relay is
-    //    reachable (WA relays are IPv4 today, but the unspecified bind must match to connect).
-    let bind_addr = if relay_addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
+    // 1. UDP leg connected to the relay: the app's own `Conn` when it supplied one, else a plain
+    //    socket. Bind in the relay's address family so an IPv6 relay is reachable (WA relays are
+    //    IPv4 today, but the unspecified bind must match to connect).
+    let udp: Arc<dyn Conn011 + Send + Sync> = match udp_maker {
+        Some(maker) => maker(relay_addr).await?,
+        None => {
+            let bind_addr = if relay_addr.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            let udp = UdpSocket::bind(bind_addr).await.context("bind udp")?;
+            udp.connect(relay_addr)
+                .await
+                .context("connect udp to relay")?;
+            Arc::new(udp)
+        }
     };
-    let udp = UdpSocket::bind(bind_addr).await.context("bind udp")?;
-    udp.connect(relay_addr)
-        .await
-        .context("connect udp to relay")?;
-    let udp: Arc<dyn Conn011 + Send + Sync> = Arc::new(udp);
 
     // 2. DTLS client. Self-signed cert (relay does not validate the client cert); skip
     //    server-cert verification (the SDP fingerprint is fixed/cosmetic; media auth is HBH SRTP).
@@ -207,6 +229,7 @@ pub async fn connect_relay_media(
         pump: std::sync::Mutex::new(None),
         assoc: std::sync::Mutex::new(Some(assoc)),
         runtime,
+        udp: udp_maker.cloned(),
     })
 }
 
@@ -288,9 +311,13 @@ impl RelayTransport for RelayMediaChannel {
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
-        RelayMediaChannelFactory::new(endpoint, self.runtime.clone())
-            .connect()
-            .await
+        RelayMediaChannelFactory {
+            addr: endpoint,
+            runtime: self.runtime.clone(),
+            udp: self.udp.clone(),
+        }
+        .connect()
+        .await
     }
 }
 
@@ -316,11 +343,26 @@ const RELAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub struct RelayMediaChannelFactory {
     addr: SocketAddr,
     runtime: Arc<dyn Runtime>,
+    udp: Option<UdpConnMaker>,
 }
 
 impl RelayMediaChannelFactory {
     pub fn new(addr: SocketAddr, runtime: Arc<dyn Runtime>) -> Self {
-        Self { addr, runtime }
+        Self {
+            addr,
+            runtime,
+            udp: None,
+        }
+    }
+
+    /// Like [`new`](Self::new), but every dial runs its DTLS client over the `Conn` that `udp`
+    /// builds for the candidate address instead of a bare UDP socket.
+    pub fn with_udp(addr: SocketAddr, runtime: Arc<dyn Runtime>, udp: UdpConnMaker) -> Self {
+        Self {
+            addr,
+            runtime,
+            udp: Some(udp),
+        }
     }
 }
 
@@ -365,8 +407,9 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
             .iter()
             .map(|&addr| {
                 let runtime = self.runtime.clone();
+                let udp = self.udp.clone();
                 Box::pin(async move {
-                    match connect_relay_media(addr, runtime).await {
+                    match connect_relay_media(addr, runtime, udp.as_ref()).await {
                         Ok(chan) => Ok((addr, chan)),
                         Err(e) => Err(anyhow!("{addr}: {e}")),
                     }
@@ -545,6 +588,52 @@ mod tests {
     fn dial_candidates_does_not_duplicate_the_web_client_port() {
         let advertised: SocketAddr = "170.78.54.98:3480".parse().unwrap();
         assert_eq!(dial_candidates(advertised), vec![advertised]);
+    }
+
+    /// A maker that records every address it is asked for and always fails.
+    fn failing_recording_maker() -> (UdpConnMaker, Arc<Mutex<Vec<SocketAddr>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let rec = asked.clone();
+        let maker: UdpConnMaker = Arc::new(move |addr| {
+            rec.lock().unwrap().push(addr);
+            Box::pin(async move { Err(anyhow!("test maker refuses {addr}")) })
+        });
+        (maker, asked)
+    }
+
+    /// `with_udp` hands the maker every dial candidate, and a maker error fails the connect.
+    #[tokio::test]
+    async fn with_udp_factory_asks_the_maker_for_every_dial_candidate() {
+        let advertised: SocketAddr = "57.144.43.57:3478".parse().unwrap();
+        let (maker, asked) = failing_recording_maker();
+        let factory = RelayMediaChannelFactory::with_udp(
+            advertised,
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            maker,
+        );
+        assert!(factory.connect().await.is_err());
+        let mut got = asked.lock().unwrap().clone();
+        let mut want = dial_candidates(advertised);
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// `new` never reaches a maker: a factory built without one dials a bare socket (here a closed
+    /// loopback port, which fails or times out without the recording maker being involved).
+    #[test]
+    fn plain_factory_carries_no_udp_maker() {
+        let addr: SocketAddr = "127.0.0.1:3480".parse().unwrap();
+        let factory =
+            RelayMediaChannelFactory::new(addr, Arc::new(crate::runtime_impl::TokioRuntime));
+        assert!(factory.udp.is_none());
+        let (maker, _) = failing_recording_maker();
+        let with = RelayMediaChannelFactory::with_udp(
+            addr,
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            maker,
+        );
+        assert!(with.udp.is_some());
     }
 
     #[tokio::test]
