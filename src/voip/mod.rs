@@ -28,6 +28,7 @@ pub mod video;
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use facade::{
     AcceptCall, CallHandle, CallLinkCall, GroupBoundCall, OutgoingCall, OutgoingGroupCall,
+    RelayTransportMaker,
 };
 pub use video::{VideoFrame, VideoSink, VideoSource};
 // Surface core types carried by the facade next to the builders and handle that expose them.

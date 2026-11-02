@@ -74,6 +74,22 @@ impl AudioEndpoints {
     }
 }
 
+/// Builds the relay media transport factory for the relay endpoint the engine selected. Passed to
+/// the call builders' `relay_transport` to replace the built-in UDP transport.
+pub type RelayTransportMaker =
+    Arc<dyn Fn(SocketAddr) -> Arc<dyn RelayTransportFactory> + Send + Sync>;
+
+fn relay_factory(
+    client: &Client,
+    maker: Option<&RelayTransportMaker>,
+    addr: SocketAddr,
+) -> Arc<dyn RelayTransportFactory> {
+    match maker {
+        Some(maker) => maker(addr),
+        None => Arc::new(RelayMediaChannelFactory::new(addr, client.runtime.clone())),
+    }
+}
+
 macro_rules! impl_media_builder_methods {
     () => {
         /// Provide the microphone source and speaker sink for the call. Channel senders and
@@ -113,6 +129,15 @@ macro_rules! impl_media_builder_methods {
             self.video = Some(VideoEndpoints::new(source, sink));
             self
         }
+
+        /// Route the call's relay media through a transport of your own instead of the built-in
+        /// UDP one, e.g. to send it through a SOCKS5 UDP relay so it leaves via the same egress as
+        /// the account's socket. `maker` is called with the relay endpoint the engine selected and
+        /// returns the factory that connects to it.
+        pub fn relay_transport(mut self, maker: RelayTransportMaker) -> Self {
+            self.relay_transport = Some(maker);
+            self
+        }
     };
 }
 
@@ -125,6 +150,7 @@ pub struct AcceptCall<'a> {
     pub(crate) incoming: &'a IncomingCall,
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
+    relay_transport: Option<RelayTransportMaker>,
 }
 
 async fn wait_for_group_relay(
@@ -154,6 +180,7 @@ impl<'a> AcceptCall<'a> {
             incoming,
             audio: None,
             video: None,
+            relay_transport: None,
         }
     }
 
@@ -331,7 +358,7 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = relay_factory(self.client, self.relay_transport.as_ref(), addr);
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
@@ -340,7 +367,7 @@ impl<'a> AcceptCall<'a> {
             &mut registration,
             teardown,
             engine,
-            &factory,
+            &*factory,
             audio,
             video,
         )
@@ -472,6 +499,7 @@ pub struct OutgoingCall<'a> {
     pub(crate) peer: &'a Jid,
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
+    relay_transport: Option<RelayTransportMaker>,
 }
 
 impl<'a> OutgoingCall<'a> {
@@ -481,6 +509,7 @@ impl<'a> OutgoingCall<'a> {
             peer,
             audio: None,
             video: None,
+            relay_transport: None,
         }
     }
 
@@ -624,6 +653,7 @@ impl<'a> OutgoingCall<'a> {
             &ring_devices,
             audio,
             video,
+            self.relay_transport.take(),
         )
         .await
     }
@@ -637,6 +667,7 @@ pub struct OutgoingGroupCall<'a> {
     exclude_local_user: bool,
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
+    relay_transport: Option<RelayTransportMaker>,
 }
 
 impl<'a> OutgoingGroupCall<'a> {
@@ -648,6 +679,7 @@ impl<'a> OutgoingGroupCall<'a> {
             exclude_local_user: false,
             audio: None,
             video: None,
+            relay_transport: None,
         }
     }
 
@@ -909,9 +941,9 @@ impl<'a> OutgoingGroupCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = relay_factory(self.client, self.relay_transport.as_ref(), addr);
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -925,6 +957,7 @@ pub struct GroupBoundCall<'a> {
     group_jid: &'a Jid,
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
+    relay_transport: Option<RelayTransportMaker>,
 }
 
 impl<'a> GroupBoundCall<'a> {
@@ -934,6 +967,7 @@ impl<'a> GroupBoundCall<'a> {
             group_jid,
             audio: None,
             video: None,
+            relay_transport: None,
         }
     }
 
@@ -962,6 +996,7 @@ impl<'a> GroupBoundCall<'a> {
             exclude_local_user: true,
             audio: self.audio.take(),
             video: self.video.take(),
+            relay_transport: self.relay_transport.take(),
         }
         .start()
         .await
@@ -979,6 +1014,7 @@ pub struct CallLinkCall<'a> {
     media: CallLinkMedia,
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
+    relay_transport: Option<RelayTransportMaker>,
 }
 
 impl<'a> CallLinkCall<'a> {
@@ -989,6 +1025,7 @@ impl<'a> CallLinkCall<'a> {
             media,
             audio: None,
             video: None,
+            relay_transport: None,
         }
     }
 
@@ -1103,9 +1140,9 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = relay_factory(self.client, self.relay_transport.as_ref(), addr);
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -1607,6 +1644,7 @@ async fn place_call(
     ring_devices: &[Jid],
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
+    relay_transport: Option<RelayTransportMaker>,
 ) -> Result<CallHandle, CallError> {
     // The offer keeps the addressed `<destination><to jid>` shape whenever the callee is multi-device
     // (computed before any pkmsg/encrypt filtering), even if one encryptable survivor remains.
@@ -1808,6 +1846,7 @@ async fn place_call(
                 muted: muted.clone(),
                 ended: ended.clone(),
                 ev_tx,
+                relay_transport,
                 rekey_rx,
             },
         );
@@ -2012,6 +2051,7 @@ pub(crate) struct PendingOutgoing {
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
+    relay_transport: Option<RelayTransportMaker>,
     /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
     /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
     rekey_rx: async_channel::Receiver<String>,
@@ -2079,7 +2119,7 @@ pub(crate) async fn attach_outgoing_relay(
             .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok::<_, CallError>((
             engine,
-            RelayMediaChannelFactory::new(addr, client.runtime.clone()),
+            relay_factory(client, pending.relay_transport.as_ref(), addr),
         ))
     })();
     let (engine, factory) = match build {
@@ -2099,7 +2139,7 @@ pub(crate) async fn attach_outgoing_relay(
         pending.generation,
         FailureCleanup::Here,
         engine,
-        &factory,
+        &*factory,
         pending.audio,
         pending.video,
         pending.video_shared,
@@ -5682,6 +5722,7 @@ mod tests {
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
+            None,
         )
         .await
         .expect("place_call");
@@ -5801,6 +5842,7 @@ mod tests {
             &devices,
             &devices,
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
         )
         .await
@@ -6211,6 +6253,7 @@ mod tests {
             std::slice::from_ref(&device),
             encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
+            None,
         )
         .await
         .expect("place encoded call");
@@ -6283,6 +6326,7 @@ mod tests {
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
+            None,
         )
         .await
         .expect("place_call");
@@ -6335,6 +6379,7 @@ mod tests {
             &[good0.clone(), good1.clone(), bad.clone()],
             &[good0.clone(), good1.clone(), bad.clone()],
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
         )
         .await
@@ -6408,6 +6453,7 @@ mod tests {
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
+            None,
         )
         .await;
         assert!(
@@ -6430,6 +6476,140 @@ mod tests {
         );
     }
 
+    /// A `RelayTransportMaker` over [`MockFactory`] that records the endpoints it was asked for.
+    /// Returns the maker, the recorded endpoints, the sends the transport captured, and the sender
+    /// that feeds the transport's inbound events (kept alive so the relay stays connected).
+    #[allow(clippy::type_complexity)]
+    fn recording_maker() -> (
+        RelayTransportMaker,
+        Arc<Mutex<Vec<SocketAddr>>>,
+        Arc<Mutex<Vec<Bytes>>>,
+        async_channel::Sender<RelayTransportEvent>,
+    ) {
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let relay_rx = Mutex::new(Some(relay_rx));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let maker: RelayTransportMaker = {
+            let asked = asked.clone();
+            let sent = sent.clone();
+            Arc::new(move |addr| {
+                asked.lock().unwrap().push(addr);
+                Arc::new(MockFactory {
+                    sent: sent.clone(),
+                    relay_rx: Mutex::new(relay_rx.lock().unwrap().take()),
+                    connects: Arc::new(AtomicUsize::new(0)),
+                })
+            })
+        };
+        (maker, asked, sent, relay_tx)
+    }
+
+    async fn wait_for_sends(sent: &Mutex<Vec<Bytes>>) {
+        for _ in 0..100 {
+            if !sent.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // The outgoing builder's `relay_transport` reaches the pending call: when the relay arrives the
+    // maker is asked for exactly the endpoint the engine selected, and the engine's packets go out
+    // through the factory it returned instead of the built-in UDP transport.
+    #[tokio::test]
+    async fn outgoing_relay_transport_maker_carries_the_engine_media() {
+        let (client, _count) = make_sending_client().await;
+        let (maker, asked, sent, _relay_tx) = recording_maker();
+        let (handle, call_id) =
+            place_dormant_outgoing_with_transport(&client, None, Some(maker)).await;
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "no relay endpoint is known before the relay arrives"
+        );
+
+        let attached = attach_outgoing_relay(&client, &call_id, &sample_relay())
+            .await
+            .expect("attach_outgoing_relay");
+        assert!(attached);
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["203.0.113.7:3478".parse::<SocketAddr>().unwrap()],
+            "the maker receives the relay endpoint the engine selected"
+        );
+        wait_for_sends(&sent).await;
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the engine's STUN allocate must go out through the supplied transport"
+        );
+        handle.hangup().await;
+    }
+
+    // Same contract on the accept side. A group offer carrying its relay inline is used because it
+    // reaches the media start without a Signal-encrypted callKey.
+    #[tokio::test]
+    async fn accept_relay_transport_maker_carries_the_engine_media() {
+        let (client, _count) = make_sending_client().await;
+        let (maker, asked, sent, _relay_tx) = recording_maker();
+        let mut incoming = incoming_offer(false);
+        let call_id = incoming.action.call_id().to_string();
+        let own_lid = client.lid().expect("own lid");
+        let mut own_device = GroupCallDevice::new(own_lid.clone());
+        own_device.pid = Some(1);
+        let mut own_participant = GroupCallParticipant::new(own_lid.to_non_ad(), vec![own_device]);
+        own_participant.state = Some("connected".to_string());
+        let participants = vec![own_participant];
+        let mut group = GroupCallUpdate::builder()
+            .call_id(call_id)
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(participants)
+            .build();
+        group.relay = Some(sample_group_relay(1));
+        incoming.group = Some(Box::new(group));
+        let mut session = wacore::voip::CallSession::new_incoming(
+            incoming.action.call_id(),
+            incoming.from.clone(),
+            incoming.action.call_creator().clone(),
+        );
+        session.group = incoming.group.as_deref().cloned();
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing group generation");
+        incoming.set_ringing_generation(generation);
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let handle = client
+            .voip()
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .relay_transport(maker)
+            .start()
+            .await
+            .expect("accept");
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["203.0.113.7:3478".parse::<SocketAddr>().unwrap()],
+            "the maker receives the relay endpoint the engine selected"
+        );
+        wait_for_sends(&sent).await;
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the engine's STUN allocate must go out through the supplied transport"
+        );
+        handle.hangup().await;
+    }
+
     /// Place a dormant outgoing call (offer sent, relay not yet arrived) and return its handle. Shares
     /// the place_call machinery the offer-send test uses; the call lands in pending_outgoing_calls.
     async fn place_dormant_outgoing(client: &Arc<Client>) -> (CallHandle, String) {
@@ -6439,6 +6619,14 @@ mod tests {
     async fn place_dormant_outgoing_with_video(
         client: &Arc<Client>,
         video: Option<VideoEndpoints>,
+    ) -> (CallHandle, String) {
+        place_dormant_outgoing_with_transport(client, video, None).await
+    }
+
+    async fn place_dormant_outgoing_with_transport(
+        client: &Arc<Client>,
+        video: Option<VideoEndpoints>,
+        relay_transport: Option<RelayTransportMaker>,
     ) -> (CallHandle, String) {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
@@ -6457,6 +6645,7 @@ mod tests {
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             video,
+            relay_transport,
         )
         .await
         .expect("place_call");
@@ -7761,6 +7950,7 @@ mod tests {
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
+            None,
         )
         .await;
         assert!(
@@ -7926,6 +8116,7 @@ mod tests {
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
             None,
         )
         .await;
