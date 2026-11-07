@@ -540,9 +540,11 @@ impl<'a> OutgoingCall<'a> {
 
     /// Resolve a PN callee to its LID, querying the server when the local cache misses so a first-ever
     /// call to a never-messaged contact still works. The cache-only `get_current_lid` returns `None`
-    /// for an unknown PN; a usync device-list query side-effect-learns the LID↔PN mapping (warming the
-    /// cache synchronously), so we retry the cache after it. A persisting miss means the server has no
-    /// LID for this PN, which is unrecoverable for key derivation, so reject.
+    /// for an unknown PN. A devices-only usync does not help: for a contact this account has never
+    /// messaged the server answers it with the PN and no LID. `is_on_whatsapp` carries the `lid`
+    /// protocol and persists the mapping it gets back, so we retry the cache after it. A number the
+    /// server says is unregistered is reported as such; a registered one with still no LID is
+    /// unrecoverable for key derivation, so reject.
     async fn resolve_callee_lid(
         &self,
         pn: &Jid,
@@ -550,12 +552,18 @@ impl<'a> OutgoingCall<'a> {
         if let Some(lid) = self.client.lid_pn_cache.get_current_lid(&pn.user).await {
             return Ok(lid);
         }
-        // The query's device records are not used here; it is the LID-PN learning side effect we want.
-        self.client
-            .signal()
-            .get_user_devices(std::slice::from_ref(pn))
+        let results = self
+            .client
+            .contacts()
+            .is_on_whatsapp(std::slice::from_ref(pn))
             .await
             .map_err(|e| CallError::Setup(e.to_string()))?;
+        if results
+            .iter()
+            .any(|r| r.jid.user == pn.user && !r.is_registered)
+        {
+            return Err(CallError::NotOnWhatsApp);
+        }
         self.client
             .lid_pn_cache
             .get_current_lid(&pn.user)
@@ -8213,6 +8221,113 @@ mod tests {
         assert!(
             matches!(res, Err(CallError::Media(_) | CallError::Setup(_))),
             "a PN callee with no resolvable LID must be rejected, not keyed off the raw PN"
+        );
+    }
+
+    /// Drive `resolve_callee_lid` for a never-messaged PN against a scripted server. A usync that
+    /// carries the `lid` protocol is answered with `lid_reply` (the children of the `<user>` node);
+    /// any other usync is answered the way the server answers a devices-only query for such a
+    /// contact: the PN with a device list and no LID.
+    async fn resolve_pn_with_server_reply(
+        lid_reply: Vec<wacore_binary::Node>,
+    ) -> (Arc<Client>, Result<wacore_binary::CompactString, CallError>) {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = create_iq_test_client().await;
+        let pn_peer = Jid::new("559900000000", Server::Pn);
+        let mut task = {
+            let client = client.clone();
+            let pn_peer = pn_peer.clone();
+            tokio::spawn(async move {
+                OutgoingCall::new(&client, &pn_peer)
+                    .resolve_callee_lid(&pn_peer)
+                    .await
+            })
+        };
+        let responder = async {
+            for frame in 0..4 {
+                let request = decode_sent_iq(&transport, frame).await;
+                let id = request
+                    .get()
+                    .attrs()
+                    .optional_string("id")
+                    .expect("usync iq carries an id")
+                    .into_owned();
+                let has_lid_protocol = request
+                    .get()
+                    .get_optional_child_by_tag(&["usync", "query", "lid"])
+                    .is_some();
+                let user_children = if has_lid_protocol {
+                    lid_reply.clone()
+                } else {
+                    vec![
+                        NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                .build()])
+                            .build(),
+                    ]
+                };
+                let response = NodeBuilder::new("iq")
+                    .attrs([
+                        ("from", "s.whatsapp.net".to_string()),
+                        ("type", "result".to_string()),
+                        ("id", id.clone()),
+                    ])
+                    .children([NodeBuilder::new("usync")
+                        .children([NodeBuilder::new("list")
+                            .children([NodeBuilder::new("user")
+                                .attr("jid", "559900000000@s.whatsapp.net")
+                                .children(user_children)
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build();
+                answer_iq(&client, &id, &response).await;
+            }
+        };
+        let res = tokio::select! {
+            res = &mut task => res.expect("resolve task should not panic"),
+            _ = responder => panic!("resolve_callee_lid sent more usync queries than expected"),
+        };
+        (client, res)
+    }
+
+    // AUL-1260: a never-messaged contact. The server answers the lid-protocol usync with the LID, which
+    // must be learned and returned so the offer can be keyed off it.
+    #[tokio::test]
+    async fn resolve_callee_lid_learns_lid_for_never_messaged_pn() {
+        use wacore_binary::builder::NodeBuilder;
+        let (client, res) = resolve_pn_with_server_reply(vec![
+            NodeBuilder::new("contact").attr("type", "in").build(),
+            NodeBuilder::new("lid").attr("val", "100000001@lid").build(),
+        ])
+        .await;
+        assert_eq!(res.expect("lid resolved").as_str(), "100000001");
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_current_lid("559900000000")
+                .await
+                .as_deref(),
+            Some("100000001"),
+            "the mapping must be persisted in the cache for later calls"
+        );
+    }
+
+    // AUL-1260: a number the server says is not registered must be reported as such, not as a media-key
+    // problem.
+    #[tokio::test]
+    async fn resolve_callee_lid_reports_number_not_on_whatsapp() {
+        use wacore_binary::builder::NodeBuilder;
+        let (_client, res) = resolve_pn_with_server_reply(vec![
+            NodeBuilder::new("contact").attr("type", "out").build(),
+        ])
+        .await;
+        assert!(
+            matches!(res, Err(CallError::NotOnWhatsApp)),
+            "expected NotOnWhatsApp, got {res:?}"
         );
     }
 
