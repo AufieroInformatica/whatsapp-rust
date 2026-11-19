@@ -687,9 +687,8 @@ const VIDEO_SCREEN_HEIGHT: &str = "1080";
 /// `<video>` for an `<offer>`: full decoder + geometry advertisement (the initiator side).
 fn video_offer_node() -> Node {
     NodeBuilder::new("video")
-        .attr("enc", "h264")
-        .attr("dec", "h264")
-        .attr("orientation", "0")
+        .attr("enc", "h.264")
+        .attr("dec", "H264")
         .attr("screen_width", VIDEO_SCREEN_WIDTH)
         .attr("screen_height", VIDEO_SCREEN_HEIGHT)
         .attr("device_orientation", "0")
@@ -2601,8 +2600,25 @@ mod tests {
             .unwrap()
             .to_owned();
         let ovr = ovnode.as_node_ref();
-        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h264"));
-        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("h264"));
+        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h.264"));
+        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ovr.attrs().optional_string("screen_width").as_deref(),
+            Some("1920")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_height").as_deref(),
+            Some("1080")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("orientation"),
+            None,
+            "a real phone's offer <video> has no orientation attr"
+        );
 
         let accept = build_accept(&AcceptParams {
             call_id: "CID",

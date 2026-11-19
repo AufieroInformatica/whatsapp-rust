@@ -21,6 +21,7 @@ use super::app_data;
 use super::audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
 };
+use super::audio_rx::AudioRxStats;
 use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
 use super::group_audio::ParticipantAudioMixer;
 use super::group_media::{
@@ -787,6 +788,7 @@ pub struct CallEngine {
     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
     /// every reassembled inbound AU so the sink can rotate.
     peer_video_orientation: u8,
+    audio_rx: AudioRxStats,
     outbox: VecDeque<Output>,
 }
 
@@ -927,6 +929,7 @@ impl CallEngine {
             group: None,
             media,
             peer_video_orientation: 0,
+            audio_rx: AudioRxStats::default(),
             outbox: VecDeque::new(),
         })
     }
@@ -1654,7 +1657,13 @@ impl CallEngine {
         }
         match input {
             Input::Timeout => self.on_timeout(now),
-            Input::RelayPacket(pkt) => self.on_packet(now, pkt),
+            Input::RelayPacket(pkt) => {
+                self.on_packet(now, pkt);
+                #[cfg(feature = "tracing")]
+                if self.group.is_none() && self.audio_rx.summary_due(now) {
+                    self.audio_rx.emit(&self.call_id);
+                }
+            }
             Input::MicFrame(pcm) => self.on_mic(pcm),
             Input::EncodedAudio(payload) => self.on_encoded_audio(payload),
             Input::VideoFrame(au) => self.on_video(au),
@@ -1877,6 +1886,7 @@ impl CallEngine {
 
     fn on_packet(&mut self, now: Millis, pkt: &[u8]) {
         let Ok(pkt) = unwrap_group_forwarding_packet(pkt) else {
+            self.audio_rx.forwarding_unwrap_failed += 1;
             return;
         };
         let pkt = pkt.payload;
@@ -1884,7 +1894,7 @@ impl CallEngine {
             RelayPacketKind::Stun => self.on_stun(now, pkt),
             RelayPacketKind::Rtp => self.on_rtp(now, pkt),
             RelayPacketKind::Rtcp => self.on_rtcp(now, pkt),
-            RelayPacketKind::Other => {}
+            RelayPacketKind::Other => self.audio_rx.demux_other += 1,
         }
     }
 
@@ -2058,7 +2068,14 @@ impl CallEngine {
         // Demux by payload type BEFORE unprotect: audio and video share E2E keys but have
         // distinct SSRCs/ROC trackers, so feeding a video packet through the audio pipeline
         // would fail its MI tag at best and desync at worst.
+        let one_to_one = self.group.is_none();
+        if one_to_one {
+            self.audio_rx.total += 1;
+        }
         let Some(wire_header) = parse_rtp_header(pkt) else {
+            if one_to_one {
+                self.audio_rx.header_parse_failed += 1;
+            }
             return;
         };
         if self.group.is_some() {
@@ -2066,9 +2083,11 @@ impl CallEngine {
             return;
         }
         let Some(m) = self.media.as_mut() else {
+            self.audio_rx.no_media += 1;
             return;
         };
         if wire_header.payload_type == RTP_PAYLOAD_TYPE_H264 {
+            self.audio_rx.video_pt += 1;
             // A PT-97 packet with no ACTIVE video plane (not negotiated, or after a downgrade) is
             // dropped. The pipe still advances its recv ROC on drop-free packets it never sees, but
             // an inactive plane simply ignores them.
@@ -2096,16 +2115,22 @@ impl CallEngine {
             }
             return;
         }
+        self.audio_rx
+            .observe_audio_header(wire_header.payload_type, wire_header.ssrc);
         if !m
             .audio
             .format
             .accepts_rtp_payload_type(wire_header.payload_type)
         {
+            self.audio_rx.audio_pt_rejected += 1;
+            self.audio_rx.last_rejected_pt = Some(wire_header.payload_type);
             return;
         }
         let Some((header, payload)) = m.pipe.unprotect_audio(pkt) else {
+            self.audio_rx.unprotect_failed += 1;
             return;
         };
+        self.audio_rx.unprotected += 1;
         m.audio_reception.observe(
             header.ssrc,
             header.sequence_number,
@@ -2115,17 +2140,25 @@ impl CallEngine {
         );
         // SFrame on: use the GCM-decrypted bytes; otherwise the SRTP payload is already plain codec.
         let encoded = match m.sframe.as_ref().map(|s| s.decrypt(&payload)) {
-            Some(SframeIn::Decrypted(plain)) => plain,
-            _ => payload,
+            Some(SframeIn::Decrypted(plain)) => {
+                self.audio_rx.sframe_decrypted += 1;
+                plain
+            }
+            _ => {
+                self.audio_rx.sframe_passthrough += 1;
+                payload
+            }
         };
         let codec = m.audio.format.inbound_codec(header.payload_type, &encoded);
         #[cfg(feature = "voip-mlow")]
         if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
+            self.audio_rx.foreign_audio += 1;
             self.outbox
                 .push_back(Output::Event(CallEvent::ForeignAudio(Bytes::from(encoded))));
             return;
         }
         if m.audio.io == AudioIo::Encoded {
+            self.audio_rx.encoded_audio += 1;
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
                     format: m.audio.format,
@@ -2144,6 +2177,7 @@ impl CallEngine {
         debug_assert_eq!(m.audio.format.codec, AudioCodec::Mlow);
         #[cfg(feature = "voip-mlow")]
         let Some(pcm) = m.pcm.as_mut() else {
+            self.audio_rx.no_pcm += 1;
             return;
         };
         #[cfg(not(feature = "voip-mlow"))]
@@ -2153,9 +2187,15 @@ impl CallEngine {
         pcm.decoder
             .set_redundancy(i32::from(header.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED));
         #[cfg(feature = "voip-mlow")]
-        for s in pcm.decoder.decode(&encoded) {
-            pcm.jitter
-                .push_back((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+        {
+            let mut samples = 0u64;
+            for s in pcm.decoder.decode(&encoded) {
+                pcm.jitter
+                    .push_back((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+                samples += 1;
+            }
+            self.audio_rx.mlow_decoded += 1;
+            self.audio_rx.mlow_samples += samples;
         }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
@@ -4275,6 +4315,33 @@ mod encoded_tests {
         assert_eq!(frame.payload_type, 120);
         assert_eq!(frame.codec, AudioCodec::Opus);
         assert_eq!(frame.format, AudioFormat::OPUS_16KHZ_60MS);
+
+        let stats = &engine.audio_rx;
+        assert_eq!(
+            (stats.total, stats.unprotected, stats.encoded_audio),
+            (1, 1, 1)
+        );
+        assert_eq!(stats.sframe_passthrough, 1);
+        assert_eq!(stats.audio_pt_rejected + stats.unprotect_failed, 0);
+
+        // A payload type the negotiated format does not accept is counted, with the PT remembered.
+        let mut odd = protected.to_vec();
+        odd[1] = (odd[1] & 0x80) | 99;
+        engine.handle_input(3, Input::RelayPacket(&odd));
+        assert!(drain(&mut engine).is_empty());
+        assert_eq!(engine.audio_rx.audio_pt_rejected, 1);
+        assert_eq!(engine.audio_rx.last_rejected_pt, Some(99));
+
+        // Right payload type, corrupt body: counted as an unprotect failure.
+        let mut bad = protected.to_vec();
+        *bad.last_mut().expect("non-empty packet") ^= 0xff;
+        engine.handle_input(4, Input::RelayPacket(&bad));
+        assert_eq!(engine.audio_rx.unprotect_failed, 1);
+        assert_eq!(engine.audio_rx.total, 3);
+
+        // Neither STUN, RTCP nor RTP.
+        engine.handle_input(5, Input::RelayPacket(&[0xff]));
+        assert_eq!(engine.audio_rx.demux_other, 1);
     }
 
     #[test]

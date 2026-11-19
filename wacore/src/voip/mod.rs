@@ -7,6 +7,7 @@
 
 pub mod app_data;
 pub mod audio;
+mod audio_rx;
 pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
