@@ -17,7 +17,7 @@ use super::rtcp::{
 use super::rtp::{
     RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_MEDIA_FRAME_INFO_DELTA,
     VIDEO_MEDIA_FRAME_INFO_IDR, VideoRtpStream, encode_rtp_header_into, parse_rtp_header,
-    rtp_header_byte_length,
+    rtp_header_byte_length, split_whatsapp_audio_piggyback,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
 use crate::types::group_call::GroupCallUpdate;
@@ -284,6 +284,16 @@ impl SrtpReplayWindow {
     }
 }
 
+/// Most distinct SSRCs the auxiliary receive state tracks: the peer's video FEC, retransmission and
+/// app-data streams. Past it an authenticated packet from a new stream is dropped.
+const MAX_AUX_RECV_STREAMS: usize = 4;
+
+/// Rollover and replay state for the peer's non-audio, non-picture streams, one entry per SSRC.
+#[derive(Default)]
+struct AuxRecvStreams {
+    streams: Vec<(u32, RecvRocTracker, SrtpReplayWindow)>,
+}
+
 /// Per-stream RTCP Sender-Report state.
 struct SrtcpSender {
     keys: E2eSrtpKeys,
@@ -381,6 +391,10 @@ pub struct MediaPipeline {
     send_roc: RocTracker,
     recv_roc: RecvRocTracker,
     recv_rtp_replay: SrtpReplayWindow,
+    /// Receive state for the peer's other streams under the same keys (video FEC, retransmission,
+    /// app-data), which the audio profile does not decode but which can carry its audio piggybacked.
+    /// Kept apart from `recv_roc` so their sequence numbers cannot disturb the audio stream's.
+    aux_recv: AuxRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -436,6 +450,7 @@ impl MediaPipeline {
             send_roc: RocTracker::default(),
             recv_roc: RecvRocTracker::default(),
             recv_rtp_replay: SrtpReplayWindow::default(),
+            aux_recv: AuxRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -497,6 +512,7 @@ impl MediaPipeline {
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_roc = RecvRocTracker::default();
         self.recv_rtp_replay = SrtpReplayWindow::default();
+        self.aux_recv = AuxRecvStreams::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -579,6 +595,60 @@ impl MediaPipeline {
         )
     }
 
+    /// Accept an audio packet the peer carried inside another of its packets, which authenticated
+    /// as a whole: the same replay and rollover state as [`Self::unprotect_audio`], keyed by the
+    /// carried packet's own sequence number.
+    ///
+    /// `false` for audio already accepted, standalone or carried. A peer can send the same audio
+    /// packet in more than one carrier, and every copy past the first would be decoded again. And
+    /// the rollover counter follows the carried audio, so standalone audio after a wrap that only
+    /// carried packets saw is still read at the counter it was protected with.
+    pub(crate) fn accept_carried_audio(&mut self, header: &RtpHeader) -> bool {
+        let roc = self.recv_roc.estimate_roc(header.sequence_number);
+        // There is no inner tag to reject a guessed index before the local origin.
+        // Committing it would put the replay maximum near 2^48 and reject later audio.
+        if roc == u32::MAX {
+            return false;
+        }
+        let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
+        if !self.recv_rtp_replay.accept(index) {
+            return false;
+        }
+        self.recv_roc.commit_roc(roc, header.sequence_number);
+        true
+    }
+
+    /// Authenticate and decrypt one of the peer's packets that is not audio for this pipeline: a
+    /// packet on its FEC, retransmission or app-data streams. Same keys and tag as the audio, which
+    /// is what the peer protects all of its streams with, but its own per-SSRC replay state.
+    ///
+    /// The point is the audio such a packet can carry piggybacked; the caller splits it off.
+    pub(crate) fn unprotect_auxiliary(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
+        let ssrc = parse_rtp_header(packet)?.ssrc;
+        let known = self.aux_recv.streams.iter().position(|s| s.0 == ssrc);
+        if known.is_none() && self.aux_recv.streams.len() >= MAX_AUX_RECV_STREAMS {
+            return None;
+        }
+        // A stream gets its slot only once a packet of it has authenticated, so forged SSRCs cannot
+        // fill the table.
+        let mut fresh = (ssrc, RecvRocTracker::default(), SrtpReplayWindow::default());
+        let entry = match known {
+            Some(i) => &mut self.aux_recv.streams[i],
+            None => &mut fresh,
+        };
+        let result = unprotect_srtp_packet(
+            &self.recv_keys,
+            &mut entry.1,
+            &mut entry.2,
+            self.warp_mi_tag_len,
+            packet,
+        );
+        if result.is_some() && known.is_none() {
+            self.aux_recv.streams.push(fresh);
+        }
+        result
+    }
+
     /// Authenticate and decrypt peer SRTCP using the sender SSRC left clear on the wire.
     pub fn unprotect_rtcp(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         let sender_ssrc = parse_rtcp_sender_ssrc(packet)?;
@@ -632,6 +702,9 @@ fn unprotect_srtp_packet(
     let plain = crypt_payload(recv_keys, header.ssrc, header.sequence_number, roc, cipher);
     Some((header, plain))
 }
+
+/// A video packet's header, the access units it completed, and the audio packet it carried.
+type VideoPacketSplit = (RtpHeader, Vec<Vec<u8>>, Option<Vec<u8>>);
 
 /// Video sibling of [`MediaPipeline`]: same E2E-SRTP keys (per participant, not
 /// per media type) and WARP MI tag, but H.264 packetization on top and its own
@@ -823,13 +896,80 @@ impl VideoPipeline {
         &mut self,
         packet: &[u8],
     ) -> Option<(RtpHeader, Vec<Vec<u8>>)> {
-        let (header, payload) = unprotect_srtp_packet(
+        self.unprotect_video_packet_split(packet)
+            .map(|(header, completed, _)| (header, completed))
+    }
+
+    /// A video packet as a WhatsApp sender writes it in a video call: `media` followed by a whole
+    /// audio RTP packet, with the `AP` header element stating where the audio starts, all protected
+    /// as one packet under `payload_type`.
+    #[cfg(test)]
+    pub(crate) fn protect_with_piggyback(
+        &mut self,
+        payload_type: u8,
+        media: &[u8],
+        audio: &[u8],
+    ) -> Vec<u8> {
+        let mut header = self
+            .rtp
+            .next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
+        header.payload_type = payload_type;
+        let roc = self.send_roc.advance(header.sequence_number);
+        let plain = [media, audio].concat();
+        let encrypted = crypt_payload(
+            &self.send_keys,
+            header.ssrc,
+            header.sequence_number,
+            roc,
+            &plain,
+        );
+        let mut packet = Vec::new();
+        encode_rtp_header_into(&header, &mut packet);
+        // The four-element video extension (12 bytes at 16..28) widened to four words with the
+        // piggyback element after the offset element.
+        let ext = packet[16..28].to_vec();
+        packet.truncate(16);
+        packet[14..16].copy_from_slice(&4u16.to_be_bytes());
+        let [high, low] = (media.len() as u16).to_be_bytes();
+        packet.extend_from_slice(&ext[..8]);
+        packet.extend_from_slice(&[0x71, high, low]);
+        packet.extend_from_slice(&ext[8..11]);
+        packet.extend_from_slice(&[0, 0]);
+        packet.extend_from_slice(&encrypted);
+        append_warp_mi_tag(&self.send_keys.auth_key, &packet, roc, self.warp_mi_tag_len)
+    }
+
+    /// Authenticate and decrypt a video packet while the plane is inactive, for the audio it
+    /// carries, without reassembling the picture.
+    pub(crate) fn unprotect_without_picture(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        let (_, mut payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_roc,
             &mut self.recv_rtp_replay,
             self.warp_mi_tag_len,
             packet,
         )?;
+        split_whatsapp_audio_piggyback(packet, &mut payload)
+    }
+
+    /// [`Self::unprotect_video_packet`], also handing back the audio packet the video packet
+    /// carried piggybacked (see `WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID`).
+    ///
+    /// Only the video part reaches the depacketizer. Fed the whole payload, the audio would be read
+    /// as the tail of an H.264 unit, which corrupts the slice it lands on, and the audio itself is
+    /// lost.
+    pub(crate) fn unprotect_video_packet_split(
+        &mut self,
+        packet: &[u8],
+    ) -> Option<VideoPacketSplit> {
+        let (header, mut payload) = unprotect_srtp_packet(
+            &self.recv_keys,
+            &mut self.recv_roc,
+            &mut self.recv_rtp_replay,
+            self.warp_mi_tag_len,
+            packet,
+        )?;
+        let piggybacked_audio = split_whatsapp_audio_piggyback(packet, &mut payload);
         let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
@@ -843,7 +983,7 @@ impl VideoPipeline {
         while let Some(au) = self.depacketizer.pop_ready() {
             completed.push(au);
         }
-        Some((header, completed))
+        Some((header, completed, piggybacked_audio))
     }
 }
 

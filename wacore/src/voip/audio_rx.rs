@@ -27,6 +27,11 @@ pub(crate) struct AudioRxStats {
     pub mlow_decoded: u64,
     pub mlow_samples: u64,
     pub no_pcm: u64,
+    /// Audio packets split off a video, FEC or app-data packet and handed to the decode path.
+    pub piggybacked: u64,
+    /// Piggybacked audio split off an authenticated packet that could not be decoded: unreadable
+    /// header, payload type outside the active profile, or no payload.
+    pub piggyback_failed: u64,
     /// Relay packets that were neither STUN, RTCP nor RTP, plus malformed group envelopes.
     pub demux_other: u64,
     pub forwarding_unwrap_failed: u64,
@@ -76,7 +81,8 @@ impl AudioRxStats {
             "voip audio rx call_id={call_id} total={} header_parse_failed={} no_media={} video_pt={} \
              audio_pt_rejected={} last_rejected_pt={:?} unprotect_failed={} unprotected={} \
              sframe_decrypted={} sframe_passthrough={} foreign_audio={} encoded_audio={} \
-             mlow_decoded={} mlow_samples={} no_pcm={} demux_other={} forwarding_unwrap_failed={} \
+             mlow_decoded={} mlow_samples={} no_pcm={} piggybacked={} piggyback_failed={} \
+             demux_other={} forwarding_unwrap_failed={} \
              last_pt={:?} last_ssrc={:?}",
             self.total,
             self.header_parse_failed,
@@ -93,6 +99,8 @@ impl AudioRxStats {
             self.mlow_decoded,
             self.mlow_samples,
             self.no_pcm,
+            self.piggybacked,
+            self.piggyback_failed,
             self.demux_other,
             self.forwarding_unwrap_failed,
             self.last_pt,

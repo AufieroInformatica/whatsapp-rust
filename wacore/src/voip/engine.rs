@@ -39,7 +39,8 @@ use super::rtcp::{
 use super::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use super::rtp::{
     RTP_PAYLOAD_TYPE_APP_DATA, RTP_PAYLOAD_TYPE_H264, VIDEO_CLOCK_RATE, VIDEO_TS_STRIDE_15FPS,
-    parse_rtp_header,
+    parse_rtp_header, parse_whatsapp_audio_piggyback_offset, plain_rtp_payload,
+    split_whatsapp_audio_piggyback,
 };
 use super::session::{
     CallDirection, MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
@@ -2095,9 +2096,13 @@ impl CallEngine {
             // A PT-97 packet with no ACTIVE video plane (not negotiated, or after a downgrade) is
             // dropped. The pipe still advances its recv ROC on drop-free packets it never sees, but
             // an inactive plane simply ignores them.
+            // The audio a WhatsApp client carries inside its video packets in a video call is taken
+            // out here and played once the media borrow has ended.
+            let mut piggybacked = None;
             if let Some(v) = m.video.as_mut().filter(|v| v.active)
-                && let Some((header, completed)) = v.pipe.unprotect_video_packet(pkt)
+                && let Some((header, completed, audio)) = v.pipe.unprotect_video_packet_split(pkt)
             {
+                piggybacked = audio;
                 v.reception.observe(
                     header.ssrc,
                     header.sequence_number,
@@ -2116,6 +2121,14 @@ impl CallEngine {
                         pid: None,
                     }));
                 }
+            } else if let Some(v) = m.video.as_mut()
+                && parse_whatsapp_audio_piggyback_offset(pkt).is_some()
+            {
+                // Picture decoding is inactive, but the carried audio is still the peer's speech.
+                piggybacked = v.pipe.unprotect_without_picture(pkt);
+            }
+            if let Some(audio) = piggybacked {
+                self.on_piggybacked_audio(now, &audio);
             }
             return;
         }
@@ -2128,6 +2141,15 @@ impl CallEngine {
         {
             self.audio_rx.audio_pt_rejected += 1;
             self.audio_rx.last_rejected_pt = Some(wire_header.payload_type);
+            // Not necessarily noise: the peer's video FEC, retransmission and app-data streams
+            // land here too, under the same keys, and in a video call they carry its audio
+            // piggybacked just as its video does.
+            if parse_whatsapp_audio_piggyback_offset(pkt).is_some()
+                && let Some((_, mut payload)) = m.pipe.unprotect_auxiliary(pkt)
+                && let Some(audio) = split_whatsapp_audio_piggyback(pkt, &mut payload)
+            {
+                self.on_piggybacked_audio(now, &audio);
+            }
             return;
         }
         let Some((header, payload)) = m.pipe.unprotect_audio(pkt) else {
@@ -2135,6 +2157,51 @@ impl CallEngine {
             return;
         };
         self.audio_rx.unprotected += 1;
+        self.on_audio_rtp(now, header, payload);
+    }
+
+    /// One audio RTP packet the peer carried inside another of its packets.
+    ///
+    /// The outer packet authenticated and was decrypted as a whole, which is what protects this
+    /// one: it is plain RTP, header and payload, with no tag of its own. From here it is audio like
+    /// any other and takes the same gate and the same decode.
+    fn on_piggybacked_audio(&mut self, now: Millis, packet: &[u8]) {
+        let Some(header) = parse_rtp_header(packet) else {
+            self.audio_rx.piggyback_failed += 1;
+            return;
+        };
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
+        if !m
+            .audio
+            .format
+            .accepts_rtp_payload_type(header.payload_type)
+        {
+            self.audio_rx.piggyback_failed += 1;
+            self.audio_rx.last_rejected_pt = Some(header.payload_type);
+            return;
+        }
+        // An RTP packet with nothing after its header carries no audio to lose.
+        let Some(payload) = plain_rtp_payload(packet) else {
+            self.audio_rx.piggyback_failed += 1;
+            return;
+        };
+        // The audio stream's own replay and rollover state, the one standalone audio passes too:
+        // the same audio inside a second carrier, or again standalone, is not decoded twice.
+        if !m.pipe.accept_carried_audio(&header) {
+            return;
+        }
+        self.audio_rx.piggybacked += 1;
+        self.on_audio_rtp(now, header, payload.to_vec());
+    }
+
+    /// The audio receive path from an authenticated, decrypted RTP packet onwards: reception
+    /// statistics, SFrame, and the decoder the packet's codec selects.
+    fn on_audio_rtp(&mut self, now: Millis, header: crate::voip::rtp::RtpHeader, payload: Vec<u8>) {
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
         m.audio_reception.observe(
             header.ssrc,
             header.sequence_number,
@@ -6761,6 +6828,162 @@ mod tests {
                 .count(),
             0,
             "a successful allocate must cancel the timeout"
+        );
+    }
+    // Hand-ported subset of oxidezap/whatsapp-rust#1720: a WhatsApp peer in a 1:1 video call carries
+    // its audio inside its video, FEC and app-data packets, behind the `AP` header element.
+    fn video_engine() -> CallEngine {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng
+    }
+
+    /// `count` plain MLOW audio RTP packets (header and payload, no tag) of the peer's audio stream.
+    fn peer_plain_audio(first_seq: u16, count: u32) -> Vec<Vec<u8>> {
+        let mut enc = MlowEncoder::new();
+        (0..count)
+            .map(|n| {
+                let tone: Vec<f32> = (0..SAMPLES as usize)
+                    .map(|i| 0.3 * ((i as f32 + (n * SAMPLES) as f32) * 0.07).sin())
+                    .collect();
+                let mut packet = crate::voip::rtp::encode_rtp_header(&crate::voip::rtp::RtpHeader {
+                    marker: false,
+                    payload_type: crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
+                    sequence_number: first_seq + n as u16,
+                    timestamp: n * SAMPLES,
+                    ssrc: SSRC,
+                    extension_word: None,
+                    video_extension: None,
+                });
+                packet.extend(enc.encode(&tone).expect("mlow encode"));
+                packet
+            })
+            .collect()
+    }
+
+    fn playout_peak(eng: &mut CallEngine) -> i16 {
+        let mut peak = 0i16;
+        for k in 1..=8 {
+            eng.handle_input(k * PLAYOUT_MS, Input::Timeout);
+            for o in drain(eng).0 {
+                if let Output::Playout(frame) = o {
+                    peak = peak.max(frame.iter().map(|s| s.abs()).max().unwrap_or(0));
+                }
+            }
+        }
+        peak
+    }
+
+    #[test]
+    fn audio_the_peer_carries_inside_its_video_becomes_sound() {
+        let mut eng = video_engine();
+        let mut peer = peer_video_pipe();
+        for audio in peer_plain_audio(100, 2) {
+            let packet = peer.protect_with_piggyback(97, &[0x41, 1, 2, 3], &audio);
+            eng.handle_input(1, Input::RelayPacket(&packet));
+        }
+        let (outs, _) = drain(&mut eng);
+        let frames: Vec<_> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Output::VideoPlayout(frame) => Some(frame),
+                _ => None,
+            })
+            .collect();
+        assert!(!frames.is_empty(), "the video part is still depacketized");
+        assert!(
+            frames.iter().all(|f| f.data.ends_with(&[0x41, 1, 2, 3])),
+            "only the media reaches the depacketizer, never the audio behind it"
+        );
+        assert_eq!(
+            (eng.audio_rx.piggybacked, eng.audio_rx.piggyback_failed),
+            (2, 0)
+        );
+        assert_eq!(eng.audio_rx.mlow_decoded, 2);
+        assert!(playout_peak(&mut eng) > 0, "carried audio reaches the speaker");
+    }
+
+    #[test]
+    fn video_without_a_piggyback_is_unaffected() {
+        let mut eng = video_engine();
+        let mut peer = peer_video_pipe();
+        for p in peer.protect_video(&video_au(120)) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_)))
+        );
+        assert_eq!(
+            (
+                eng.audio_rx.piggybacked,
+                eng.audio_rx.piggyback_failed,
+                eng.audio_rx.mlow_decoded
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn audio_carried_by_a_stream_the_profile_does_not_decode_is_heard() {
+        let mut eng = video_engine();
+        let mut peer = peer_video_pipe();
+        for audio in peer_plain_audio(100, 2) {
+            // Payload type 96: the peer's FEC stream, which the audio profile rejects as audio.
+            let packet = peer.protect_with_piggyback(96, &[1, 2, 3, 4], &audio);
+            eng.handle_input(1, Input::RelayPacket(&packet));
+        }
+        assert_eq!(eng.audio_rx.audio_pt_rejected, 2);
+        assert_eq!(eng.audio_rx.piggybacked, 2);
+        assert!(playout_peak(&mut eng) > 0);
+    }
+
+    #[test]
+    fn the_same_carried_audio_is_decoded_once() {
+        let mut eng = video_engine();
+        let mut peer = peer_video_pipe();
+        let audio = peer_plain_audio(100, 1).remove(0);
+        for _ in 0..2 {
+            let packet = peer.protect_with_piggyback(97, &[0x41, 1, 2, 3], &audio);
+            eng.handle_input(1, Input::RelayPacket(&packet));
+        }
+        assert_eq!(eng.audio_rx.piggybacked, 1);
+        assert_eq!(eng.audio_rx.mlow_decoded, 1);
+    }
+
+    #[test]
+    fn a_carrier_that_fails_its_tag_gives_no_audio() {
+        let mut eng = video_engine();
+        let mut peer = peer_video_pipe();
+        let audio = peer_plain_audio(100, 1).remove(0);
+        for payload_type in [97, 96] {
+            let mut packet = peer.protect_with_piggyback(payload_type, &[0x41, 1, 2, 3], &audio);
+            let last = packet.len() - 1;
+            packet[last] ^= 0xff;
+            eng.handle_input(1, Input::RelayPacket(&packet));
+        }
+        assert_eq!(
+            (eng.audio_rx.piggybacked, eng.audio_rx.mlow_decoded),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn carried_audio_outside_the_profile_is_counted_as_failed() {
+        let mut eng = video_engine();
+        let mut peer = peer_video_pipe();
+        let mut audio = peer_plain_audio(100, 1).remove(0);
+        audio[1] = 99;
+        let packet = peer.protect_with_piggyback(97, &[0x41, 1, 2, 3], &audio);
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        assert_eq!(
+            (eng.audio_rx.piggybacked, eng.audio_rx.piggyback_failed),
+            (0, 1)
         );
     }
 }
