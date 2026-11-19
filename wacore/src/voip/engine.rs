@@ -1659,7 +1659,6 @@ impl CallEngine {
             Input::Timeout => self.on_timeout(now),
             Input::RelayPacket(pkt) => {
                 self.on_packet(now, pkt);
-                #[cfg(feature = "tracing")]
                 if self.group.is_none() && self.audio_rx.summary_due(now) {
                     self.audio_rx.emit(&self.call_id);
                 }

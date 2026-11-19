@@ -10,7 +10,6 @@ const SUMMARY_INTERVAL_MS: Millis = 2000;
 /// Cap on distinct payload types / SSRCs tracked for the "first seen" summary.
 const MAX_TRACKED: usize = 8;
 
-#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct AudioRxStats {
     pub total: u64,
@@ -39,7 +38,6 @@ pub(crate) struct AudioRxStats {
     last_summary: Option<Millis>,
 }
 
-#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
 impl AudioRxStats {
     /// Record the payload type and SSRC of a non-video packet, flagging the first sighting of each.
     pub(crate) fn observe_audio_header(&mut self, payload_type: u8, ssrc: u32) {
@@ -72,31 +70,33 @@ impl AudioRxStats {
         true
     }
 
-    #[cfg(feature = "tracing")]
     pub(crate) fn emit(&self, call_id: &str) {
-        tracing::debug!(
+        log::debug!(
             target: "wacore::voip::audio_rx",
-            call_id = %call_id,
-            total = self.total,
-            header_parse_failed = self.header_parse_failed,
-            no_media = self.no_media,
-            video_pt = self.video_pt,
-            audio_pt_rejected = self.audio_pt_rejected,
-            last_rejected_pt = ?self.last_rejected_pt,
-            unprotect_failed = self.unprotect_failed,
-            unprotected = self.unprotected,
-            sframe_decrypted = self.sframe_decrypted,
-            sframe_passthrough = self.sframe_passthrough,
-            foreign_audio = self.foreign_audio,
-            encoded_audio = self.encoded_audio,
-            mlow_decoded = self.mlow_decoded,
-            mlow_samples = self.mlow_samples,
-            no_pcm = self.no_pcm,
-            demux_other = self.demux_other,
-            forwarding_unwrap_failed = self.forwarding_unwrap_failed,
-            last_pt = ?self.last_pt,
-            last_ssrc = ?self.last_ssrc,
-            "voip audio rx"
+            "voip audio rx call_id={call_id} total={} header_parse_failed={} no_media={} video_pt={} \
+             audio_pt_rejected={} last_rejected_pt={:?} unprotect_failed={} unprotected={} \
+             sframe_decrypted={} sframe_passthrough={} foreign_audio={} encoded_audio={} \
+             mlow_decoded={} mlow_samples={} no_pcm={} demux_other={} forwarding_unwrap_failed={} \
+             last_pt={:?} last_ssrc={:?}",
+            self.total,
+            self.header_parse_failed,
+            self.no_media,
+            self.video_pt,
+            self.audio_pt_rejected,
+            self.last_rejected_pt,
+            self.unprotect_failed,
+            self.unprotected,
+            self.sframe_decrypted,
+            self.sframe_passthrough,
+            self.foreign_audio,
+            self.encoded_audio,
+            self.mlow_decoded,
+            self.mlow_samples,
+            self.no_pcm,
+            self.demux_other,
+            self.forwarding_unwrap_failed,
+            self.last_pt,
+            self.last_ssrc,
         );
     }
 }
@@ -125,6 +125,18 @@ mod tests {
         assert!(!s.summary_due(2_099));
         assert!(s.summary_due(2_100));
         assert!(!s.summary_due(2_101));
+    }
+
+    #[test]
+    fn summary_due_on_first_sighting_not_within_2000ms_then_again() {
+        let mut s = AudioRxStats {
+            total: 1,
+            ..Default::default()
+        };
+        s.observe_audio_header(120, 7);
+        assert!(s.summary_due(10_000));
+        assert!(!s.summary_due(11_999));
+        assert!(s.summary_due(12_000));
     }
 
     #[test]
