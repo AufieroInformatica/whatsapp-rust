@@ -4,6 +4,7 @@
 //! cross-frame predictor and synthesis history persist across calls because the stream is
 //! continuous.
 
+use super::multiframe::{is_multiframe, split_multiframe};
 use super::rangecoder::RangeDecoder;
 use super::red::depack_split_red;
 use super::smpl_cc_tables::load_cc_tables;
@@ -20,8 +21,15 @@ use super::toc::parse_mlow_toc;
 
 const OPUS_FRAME_SAMPS: usize = 960; // 60 ms @ 16 kHz
 
-/// Stateful pure-Rust MLow decoder. Decodes one RTP payload (a bare MLow frame, or a SplitRed
-/// packet when redundancy was negotiated) into a 60 ms / 960-sample PCM frame at 16 kHz.
+/// The longest audio one packet may carry (120 ms @ 16 kHz): the longest duration a TOC can declare
+/// and the ceiling the shipped client applies when it totals a multiframe envelope. A hard bound:
+/// without it an envelope of eighteen sub-frames expands a few hundred bytes into thousands of
+/// samples that the jitter buffer cannot tell from real audio.
+const MAX_PACKET_SAMPS: usize = 1920;
+
+/// Stateful pure-Rust MLow decoder. Decodes one RTP payload (a bare MLow frame, a multiframe
+/// envelope, or a SplitRed packet when redundancy was negotiated) into PCM at 16 kHz: 960 samples
+/// for a single 60 ms frame, one such slot per sub-frame for an envelope.
 pub struct MlowDecoder {
     state: SmplDecoderState,
     redundancy: i32,
@@ -36,6 +44,10 @@ pub struct MlowDecoder {
     /// the offending dimension) so a live capture reveals whether real peers emit these (decides the
     /// follow-ups).
     dropped_unsupported: u32,
+    /// Malformed multiframe envelopes concealed so far; drives a once + every-100th `warn`.
+    malformed: u32,
+    /// Whether the most recent `decode` call unpacked a multiframe envelope.
+    last_was_multiframe: bool,
 }
 
 impl Default for MlowDecoder {
@@ -51,6 +63,8 @@ impl MlowDecoder {
             redundancy: 0,
             had_error: false,
             dropped_unsupported: 0,
+            malformed: 0,
+            last_was_multiframe: false,
         }
     }
 
@@ -60,6 +74,12 @@ impl MlowDecoder {
     #[cfg(test)]
     pub(crate) fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Whether the most recent `decode` call unpacked a multiframe envelope (also one carried inside
+    /// a RED wrapper), so a caller can count them.
+    pub fn last_was_multiframe(&self) -> bool {
+        self.last_was_multiframe
     }
 
     /// Set the negotiated RED redundancy level (0 = bare frames, the common case).
@@ -73,17 +93,21 @@ impl MlowDecoder {
         self.had_error = false;
     }
 
-    /// Decode one RTP MLow payload into a 60 ms (960-sample) PCM frame, float in [-1, 1].
+    /// Decode one RTP MLow payload into PCM, float in [-1, 1]. A single frame yields a 60 ms
+    /// (960-sample) slot; a multiframe envelope yields the concatenation of its sub-frames.
     pub fn decode(&mut self, payload: &[u8]) -> Vec<f32> {
+        self.last_was_multiframe = false;
         if payload.is_empty() {
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         if self.redundancy > 0 {
             return match depack_split_red(payload) {
                 // the main (current) frame is last; its slice borrows `payload`, not `self`, so it
-                // can drive the decode directly (no copy).
+                // can drive the decode directly (no copy). Through `decode_inner`, not
+                // `decode_frame`: the frame inside a RED wrapper can itself be a multiframe
+                // envelope, which `decode_frame` would read as a SID.
                 Ok(frames) => match frames.last() {
-                    Some(main) => self.decode_frame(main.data),
+                    Some(main) => self.decode_inner(main.data),
                     None => self.decode_frame(&[]),
                 },
                 Err(e) => {
@@ -92,7 +116,58 @@ impl MlowDecoder {
                 }
             };
         }
+        self.decode_inner(payload)
+    }
+
+    /// Route one bare MLow payload: multiframe envelope, or a single frame. The envelope is checked
+    /// before the TOC is read, because its indicator byte has bit 7 set and would read as a SID.
+    fn decode_inner(&mut self, payload: &[u8]) -> Vec<f32> {
+        if is_multiframe(payload) {
+            return self.decode_multiframe(payload);
+        }
         self.decode_frame(payload)
+    }
+
+    /// Decode every sub-frame of an envelope, in transmission order, into one contiguous packet.
+    /// The envelope's RTP timestamp belongs to the LAST sub-frame and the earlier ones run backwards
+    /// from it, so array order is time order.
+    fn decode_multiframe(&mut self, payload: &[u8]) -> Vec<f32> {
+        let frames = match split_multiframe(payload) {
+            Ok(frames) => frames,
+            Err(e) => {
+                self.note_malformed(&format!("failed to parse ({e})"), payload[0]);
+                return vec![0.0; OPUS_FRAME_SAMPS];
+            }
+        };
+        // Refuse before decoding anything: half-decoding an over-long packet would advance the
+        // predictor by frames the peer never meant as one packet.
+        let declared: usize = frames
+            .iter()
+            .map(|f| output_samps(f.first().copied().unwrap_or(0)))
+            .sum();
+        if declared > MAX_PACKET_SAMPS {
+            self.note_malformed(
+                &format!("declares {declared} samples, past the {MAX_PACKET_SAMPS} ceiling"),
+                payload[0],
+            );
+            return vec![0.0; OPUS_FRAME_SAMPS];
+        }
+        self.last_was_multiframe = true;
+        let mut out = Vec::with_capacity(declared);
+        for frame in frames {
+            out.extend_from_slice(&self.decode_frame(frame));
+        }
+        out
+    }
+
+    fn note_malformed(&mut self, what: &str, indicator: u8) {
+        self.malformed += 1;
+        if self.malformed == 1 || self.malformed.is_multiple_of(100) {
+            log::warn!(
+                "mlow: multiframe packet #{} {what} (indicator 0x{indicator:02x}); concealed as one lost frame",
+                self.malformed
+            );
+        }
     }
 
     fn decode_frame(&mut self, frame: &[u8]) -> Vec<f32> {
@@ -270,6 +345,18 @@ impl MlowDecoder {
             out.len()
         );
         out
+    }
+}
+
+/// Samples `decode_frame` emits for a frame with this TOC byte: its own length for the standard-Opus
+/// escape, otherwise one 60 ms slot (active frames at that duration, and every silenced or dropped
+/// frame).
+fn output_samps(toc_byte: u8) -> usize {
+    let toc = parse_mlow_toc(toc_byte);
+    if toc.std_opus {
+        (16000 / 1000 * toc.frame_ms) as usize
+    } else {
+        OPUS_FRAME_SAMPS
     }
 }
 
@@ -605,5 +692,125 @@ mod tests {
             !red_dec.had_error(),
             "RED decode raised the range decoder error flag"
         );
+    }
+
+    fn tone_frames(n: usize) -> Vec<Vec<u8>> {
+        let mut encoder = super::super::encode::MlowEncoder::new();
+        let tone: Vec<f32> = (0..OPUS_FRAME_SAMPS)
+            .map(|i| 0.3 * (i as f32 * 0.05).sin())
+            .collect();
+        (0..n)
+            .map(|_| encoder.encode(&tone).expect("mlow encode"))
+            .collect()
+    }
+
+    fn envelope_of(frames: &[Vec<u8>]) -> Vec<u8> {
+        assert!(frames.iter().all(|f| f.len() < 252));
+        let mut envelope = vec![0x82 | (frames[0][0] & 0x39), frames.len() as u8];
+        envelope.extend(frames[..frames.len() - 1].iter().map(|f| f.len() as u8));
+        for f in frames {
+            envelope.extend_from_slice(f);
+        }
+        envelope
+    }
+
+    // The bug this replaces: read as a TOC, the indicator has bit 7 set and is a SID, so every packet
+    // of a call whose peer sends envelopes (a 0x92 first byte) became comfort silence.
+    #[test]
+    fn a_multiframe_envelope_decodes_instead_of_becoming_silence() {
+        let frames = tone_frames(2);
+        let envelope = envelope_of(&frames);
+        assert_eq!(
+            envelope[0], 0x92,
+            "an inner 0x50 TOC gives the 0x92 indicator"
+        );
+        assert!(parse_mlow_toc(envelope[0]).sid);
+
+        let mut single = MlowDecoder::new();
+        let one = single.decode(&frames[0]);
+        assert_eq!(one.len(), OPUS_FRAME_SAMPS);
+        assert!(!single.last_was_multiframe());
+
+        let mut decoder = MlowDecoder::new();
+        let pcm = decoder.decode(&envelope);
+        assert!(decoder.last_was_multiframe());
+        assert_eq!(pcm.len(), 2 * OPUS_FRAME_SAMPS);
+        assert!(
+            pcm.iter().any(|&s| s != 0.0),
+            "a decoded envelope must not be silence"
+        );
+        assert_eq!(
+            &pcm[..OPUS_FRAME_SAMPS],
+            one.as_slice(),
+            "the first sub-frame decodes exactly as it would alone"
+        );
+        assert_eq!(decoder.dropped_unsupported, 0);
+        assert!(!decoder.had_error());
+    }
+
+    #[test]
+    fn a_true_sid_is_still_silence() {
+        for toc in [0x90u8, 0x94, 0x98] {
+            let mut decoder = MlowDecoder::new();
+            let pcm = decoder.decode(&[toc, 0x01, 0x02]);
+            assert_eq!(pcm.len(), OPUS_FRAME_SAMPS, "TOC {toc:#04x}");
+            assert!(pcm.iter().all(|&s| s == 0.0), "TOC {toc:#04x}");
+            assert!(!decoder.last_was_multiframe());
+        }
+    }
+
+    #[test]
+    fn a_malformed_multiframe_envelope_is_concealed_without_panicking() {
+        let frames = tone_frames(2);
+        let good = envelope_of(&frames);
+        let mut bad: Vec<Vec<u8>> = vec![
+            vec![0x92],
+            vec![0x92, 0x02],
+            vec![0x92, 0x02, 5],
+            // two frames declared, the first taking the whole body
+            [vec![0x92u8, 0x02, 10], (0..10u8).collect()].concat(),
+            // a length that runs past the end
+            [vec![0x92u8, 0x02, 200], (0..10u8).collect()].concat(),
+            // frame count outside 1..=18
+            [vec![0x92u8, 0x3f], (0..40u8).collect()].concat(),
+        ];
+        // every truncation of a real envelope
+        bad.extend((1..good.len()).map(|n| good[..n].to_vec()));
+        let mut decoder = MlowDecoder::new();
+        for packet in &bad {
+            let pcm = decoder.decode(packet);
+            assert!(!pcm.is_empty());
+            assert!(pcm.len() <= MAX_PACKET_SAMPS, "{} samples", pcm.len());
+        }
+        let pcm = decoder.decode(&[0x92, 0x02, 10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(pcm.len(), OPUS_FRAME_SAMPS);
+        assert!(pcm.iter().all(|&s| s == 0.0));
+        assert!(!decoder.last_was_multiframe());
+    }
+
+    #[test]
+    fn an_envelope_past_the_duration_ceiling_is_concealed() {
+        let frames = tone_frames(1);
+        // three 60 ms sub-frames = 180 ms, over the 120 ms ceiling
+        let envelope = envelope_of(&[frames[0].clone(), frames[0].clone(), frames[0].clone()]);
+        let mut decoder = MlowDecoder::new();
+        let pcm = decoder.decode(&envelope);
+        assert_eq!(pcm.len(), OPUS_FRAME_SAMPS);
+        assert!(pcm.iter().all(|&s| s == 0.0));
+        assert!(!decoder.last_was_multiframe());
+    }
+
+    // The frame inside a RED wrapper can itself be an envelope.
+    #[test]
+    fn an_envelope_inside_a_red_wrapper_decodes() {
+        let envelope = envelope_of(&tone_frames(2));
+        let mut payload = vec![0x80u8, 2, 0x00, 0xAA, 0xBB];
+        payload.extend_from_slice(&envelope);
+        let mut decoder = MlowDecoder::new();
+        decoder.set_redundancy(1);
+        let pcm = decoder.decode(&payload);
+        assert!(decoder.last_was_multiframe());
+        assert_eq!(pcm.len(), 2 * OPUS_FRAME_SAMPS);
+        assert!(pcm.iter().any(|&s| s != 0.0));
     }
 }

@@ -26,6 +26,8 @@ pub(crate) struct AudioRxStats {
     pub encoded_audio: u64,
     pub mlow_decoded: u64,
     pub mlow_samples: u64,
+    /// MLow packets that were multiframe envelopes (also counted in `mlow_decoded`).
+    pub mlow_multiframe: u64,
     pub no_pcm: u64,
     /// Audio packets split off a video, FEC or app-data packet and handed to the decode path.
     pub piggybacked: u64,
@@ -81,7 +83,7 @@ impl AudioRxStats {
             "voip audio rx call_id={call_id} total={} header_parse_failed={} no_media={} video_pt={} \
              audio_pt_rejected={} last_rejected_pt={:?} unprotect_failed={} unprotected={} \
              sframe_decrypted={} sframe_passthrough={} foreign_audio={} encoded_audio={} \
-             mlow_decoded={} mlow_samples={} no_pcm={} piggybacked={} piggyback_failed={} \
+             mlow_decoded={} mlow_samples={} mlow_multiframe={} no_pcm={} piggybacked={} piggyback_failed={} \
              demux_other={} forwarding_unwrap_failed={} \
              last_pt={:?} last_ssrc={:?}",
             self.total,
@@ -98,6 +100,7 @@ impl AudioRxStats {
             self.encoded_audio,
             self.mlow_decoded,
             self.mlow_samples,
+            self.mlow_multiframe,
             self.no_pcm,
             self.piggybacked,
             self.piggyback_failed,

@@ -83,6 +83,24 @@ const PLAYOUT_CAP: usize = 2400;
 /// arrival underruns. The cushion has to be one frame above what the per-cycle drain consumes.
 #[cfg(feature = "voip-mlow")]
 const PLAYOUT_TARGET: usize = 1920;
+/// 60ms @ 16kHz: the peer packet size the constants above were written for, and the assumption
+/// until the first decode reports what the peer actually sends.
+#[cfg(feature = "voip-mlow")]
+const OPUS_FRAME_SAMPS_60MS: usize = 960;
+/// Room kept above the prime target before a burst is trimmed (`PLAYOUT_CAP - PLAYOUT_TARGET`).
+#[cfg(feature = "voip-mlow")]
+const PLAYOUT_HEADROOM: usize = 480;
+
+/// Prime target and latency ceiling for a peer sending `packet_samps`-sample packets. A multiframe
+/// envelope is one 120ms packet, a full [`PLAYOUT_TARGET`] on its own: priming would end on the
+/// first one with no cushion, and two in flight would exceed [`PLAYOUT_CAP`] and be trimmed on
+/// arrival. Same shape instead: prime to two packets, ceiling one headroom above. A 60ms peer gets
+/// exactly the constants above.
+#[cfg(feature = "voip-mlow")]
+fn playout_bounds(packet_samps: usize) -> (usize, usize) {
+    let target = PLAYOUT_TARGET.max(packet_samps.saturating_mul(2));
+    (target, PLAYOUT_CAP.max(target + PLAYOUT_HEADROOM))
+}
 /// Bound on how long playout primes before flushing a partial buffer: if the peer sends one frame
 /// then goes DTX the jitter buffer never reaches `PLAYOUT_TARGET`, so after this many 20ms ticks
 /// (~200ms) drain whatever is queued instead of holding it (silent) forever. Comfortably above the
@@ -648,6 +666,9 @@ struct PcmAudioState {
     /// Consecutive playout ticks spent priming; bounds the wait so a partial buffer (the peer sent one
     /// frame then went DTX) is flushed after `MAX_PRIME_TICKS` instead of being held silent forever.
     priming_ticks: u32,
+    /// Samples in the peer's most recent packet, the input to [`playout_bounds`]. Starts at the
+    /// 60ms the constants assume.
+    packet_samps: usize,
 }
 
 /// The video half of the media plane. No jitter buffer or playout tick: an AU is handed to the
@@ -905,6 +926,7 @@ impl CallEngine {
                     jitter: VecDeque::new(),
                     priming: true,
                     priming_ticks: 0,
+                    packet_samps: OPUS_FRAME_SAMPS_60MS,
                 }),
                 playout_deadline: NEVER,
             })
@@ -1767,7 +1789,12 @@ impl CallEngine {
                 let frame = if let Some(frame) = group_frame {
                     frame
                 } else if let Some(pcm) = m.pcm.as_mut() {
-                    drain_playout(&mut pcm.jitter, &mut pcm.priming, &mut pcm.priming_ticks)
+                    drain_playout(
+                        &mut pcm.jitter,
+                        &mut pcm.priming,
+                        &mut pcm.priming_ticks,
+                        pcm.packet_samps,
+                    )
                 } else {
                     Vec::new()
                 };
@@ -2267,13 +2294,19 @@ impl CallEngine {
             }
             self.audio_rx.mlow_decoded += 1;
             self.audio_rx.mlow_samples += samples;
+            if pcm.decoder.last_was_multiframe() {
+                self.audio_rx.mlow_multiframe += 1;
+            }
+            if samples > 0 {
+                pcm.packet_samps = samples as usize;
+            }
         }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
         // tick). Drop oldest past the same ceiling the drain path uses.
         #[cfg(feature = "voip-mlow")]
-        if pcm.jitter.len() > PLAYOUT_CAP {
-            let drop_n = pcm.jitter.len() - PLAYOUT_CAP;
+        if pcm.jitter.len() > playout_bounds(pcm.packet_samps).1 {
+            let drop_n = pcm.jitter.len() - playout_bounds(pcm.packet_samps).1;
             pcm.jitter.drain(..drop_n);
         }
     }
@@ -2694,13 +2727,15 @@ fn drain_playout(
     jitter: &mut VecDeque<i16>,
     priming: &mut bool,
     priming_ticks: &mut u32,
+    packet_samps: usize,
 ) -> Vec<i16> {
-    if jitter.len() > PLAYOUT_CAP {
-        let drop_n = jitter.len() - PLAYOUT_CAP;
+    let (target, cap) = playout_bounds(packet_samps);
+    if jitter.len() > cap {
+        let drop_n = jitter.len() - cap;
         jitter.drain(..drop_n);
     }
     if *priming {
-        let reached_target = jitter.len() >= PLAYOUT_TARGET;
+        let reached_target = jitter.len() >= target;
         // Bounded wait: a partial buffer that never reaches the target (peer DTX after one frame) is
         // flushed rather than held silent forever / replayed stale when a much later packet arrives.
         let timed_out = *priming_ticks >= MAX_PRIME_TICKS && !jitter.is_empty();
@@ -4828,18 +4863,28 @@ mod tests {
         // One frame is below PLAYOUT_TARGET (two frames): playout holds silence without draining.
         feed_frame(&mut buf);
         assert!(
-            drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                .iter()
-                .all(|&s| s == 0),
+            drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS
+            )
+            .iter()
+            .all(|&s| s == 0),
             "below the prebuffer target playout primes with silence"
         );
         assert_eq!(buf.len(), 960, "priming must not consume the buffer");
         // The second frame reaches the target; playout now produces real audio.
         feed_frame(&mut buf);
         assert!(
-            drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                .iter()
-                .any(|&s| s != 0),
+            drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS
+            )
+            .iter()
+            .any(|&s| s != 0),
             "at the prebuffer target playout starts real audio"
         );
     }
@@ -4891,9 +4936,14 @@ mod tests {
         let real: Vec<bool> = (0..ticks)
             .map(|t| {
                 feed(&mut buf, t);
-                drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                    .iter()
-                    .any(|&s| s != 0)
+                drain_playout(
+                    &mut buf,
+                    &mut priming,
+                    &mut priming_ticks,
+                    OPUS_FRAME_SAMPS_60MS,
+                )
+                .iter()
+                .any(|&s| s != 0)
             })
             .collect();
         assert_eq!(
@@ -5172,6 +5222,55 @@ mod tests {
         let stats = &eng.audio_rx;
         assert_eq!((stats.audio_pt_rejected, stats.unprotect_failed), (0, 0));
         assert_eq!((stats.unprotected, stats.mlow_decoded), (1, 1));
+    }
+
+    // A peer in a video call sends its voice as multiframe envelopes (first byte 0x92). Read as a TOC
+    // that is a SID, so the speaker stayed silent; it must decode to both sub-frames and play out.
+    #[test]
+    fn a_multiframe_envelope_reaches_playout_as_sound() {
+        let mut eng = engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut peer_tx = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: SSRC,
+            samples_per_packet: SAMPLES,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        let tone = (0..SAMPLES as usize)
+            .map(|sample| 0.3 * (sample as f32 * 0.05).sin())
+            .collect::<Vec<_>>();
+        let mut enc = MlowEncoder::new();
+        let first = enc.encode(&tone).expect("MLOW frame");
+        let second = enc.encode(&tone).expect("MLOW frame");
+        let mut envelope = vec![0x82 | (first[0] & 0x39), 0x02, first.len() as u8];
+        envelope.extend_from_slice(&first);
+        envelope.extend_from_slice(&second);
+        assert_eq!(envelope[0], 0x92);
+        let packet = peer_tx.protect_audio(&envelope);
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+
+        assert_eq!(eng.jitter_len(), 2 * SAMPLES as usize);
+        assert_eq!(eng.audio_rx.mlow_decoded, 1);
+        assert_eq!(eng.audio_rx.mlow_multiframe, 1);
+        let mut peak = 0i16;
+        let mut played = 0usize;
+        for k in 1..=16 {
+            eng.handle_input(k * PLAYOUT_MS, Input::Timeout);
+            for o in drain(&mut eng).0 {
+                if let Output::Playout(frame) = o {
+                    peak = peak.max(frame.iter().map(|s| s.abs()).max().unwrap_or(0));
+                    played += frame.len();
+                }
+            }
+        }
+        assert!(peak > 0, "envelope audio must reach the speaker");
+        assert!(played >= 2 * SAMPLES as usize);
     }
 
     // End-to-end of the device-mismatch fix: an engine built for the dialed base callee LID receives
@@ -6120,7 +6219,12 @@ mod tests {
             if arrivals.contains(&t) {
                 feed_frame(&mut buf);
             }
-            let _ = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+            let _ = drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            );
             max_occupancy = max_occupancy.max(buf.len());
         }
         assert!(
@@ -6133,9 +6237,14 @@ mod tests {
             if t % 3 == 0 {
                 feed_frame(&mut buf);
             }
-            if drain_playout(&mut buf, &mut priming, &mut priming_ticks)
-                .iter()
-                .any(|&s| s != 0)
+            if drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            )
+            .iter()
+            .any(|&s| s != 0)
             {
                 recovered = true;
             }
@@ -6157,7 +6266,12 @@ mod tests {
         feed_frame(&mut buf); // one 60ms frame (960) < PLAYOUT_TARGET (1920), then nothing (DTX)
         // Up to MAX_PRIME_TICKS the partial buffer is held: silence, no drain.
         for _ in 0..MAX_PRIME_TICKS {
-            let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+            let f = drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            );
             assert!(f.iter().all(|&s| s == 0), "still priming -> silence");
             assert_eq!(
                 buf.len(),
@@ -6166,7 +6280,12 @@ mod tests {
             );
         }
         // The next tick hits the bound and flushes the held frame as real audio.
-        let flushed = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+        let flushed = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut priming_ticks,
+            OPUS_FRAME_SAMPS_60MS,
+        );
         assert!(
             flushed.iter().any(|&s| s != 0),
             "the partial buffer must flush to real audio after the bounded wait"
@@ -6186,12 +6305,22 @@ mod tests {
         let mut priming = true;
         let mut priming_ticks = 0u32;
         for _ in 0..(MAX_PRIME_TICKS * 2) {
-            let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+            let f = drain_playout(
+                &mut buf,
+                &mut priming,
+                &mut priming_ticks,
+                OPUS_FRAME_SAMPS_60MS,
+            );
             assert!(f.iter().all(|&s| s == 0), "empty buffer -> silence");
         }
         // First frame arrives: must NOT flush instantly -- the counter didn't age while empty.
         feed_frame(&mut buf);
-        let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+        let f = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut priming_ticks,
+            OPUS_FRAME_SAMPS_60MS,
+        );
         assert!(
             f.iter().all(|&s| s == 0),
             "one frame is below the target -> still priming, no instant flush"
@@ -6199,7 +6328,12 @@ mod tests {
         assert_eq!(buf.len(), 960, "the first frame is held for the cushion");
         // The second frame reaches the target -> real audio drains.
         feed_frame(&mut buf);
-        let f = drain_playout(&mut buf, &mut priming, &mut priming_ticks);
+        let f = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut priming_ticks,
+            OPUS_FRAME_SAMPS_60MS,
+        );
         assert!(
             f.iter().any(|&s| s != 0),
             "at the target playout starts real audio"
@@ -6849,15 +6983,16 @@ mod tests {
                 let tone: Vec<f32> = (0..SAMPLES as usize)
                     .map(|i| 0.3 * ((i as f32 + (n * SAMPLES) as f32) * 0.07).sin())
                     .collect();
-                let mut packet = crate::voip::rtp::encode_rtp_header(&crate::voip::rtp::RtpHeader {
-                    marker: false,
-                    payload_type: crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
-                    sequence_number: first_seq + n as u16,
-                    timestamp: n * SAMPLES,
-                    ssrc: SSRC,
-                    extension_word: None,
-                    video_extension: None,
-                });
+                let mut packet =
+                    crate::voip::rtp::encode_rtp_header(&crate::voip::rtp::RtpHeader {
+                        marker: false,
+                        payload_type: crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
+                        sequence_number: first_seq + n as u16,
+                        timestamp: n * SAMPLES,
+                        ssrc: SSRC,
+                        extension_word: None,
+                        video_extension: None,
+                    });
                 packet.extend(enc.encode(&tone).expect("mlow encode"));
                 packet
             })
@@ -6903,7 +7038,10 @@ mod tests {
             (2, 0)
         );
         assert_eq!(eng.audio_rx.mlow_decoded, 2);
-        assert!(playout_peak(&mut eng) > 0, "carried audio reaches the speaker");
+        assert!(
+            playout_peak(&mut eng) > 0,
+            "carried audio reaches the speaker"
+        );
     }
 
     #[test]
