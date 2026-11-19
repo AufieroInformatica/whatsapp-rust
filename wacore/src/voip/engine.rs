@@ -4336,12 +4336,20 @@ mod encoded_tests {
         assert_eq!(engine.audio_rx.audio_pt_rejected, 1);
         assert_eq!(engine.audio_rx.last_rejected_pt, Some(99));
 
+        // 122 is MLOW's own type; the standard Opus profile has no use for it and still rejects it.
+        let mut separate = protected.to_vec();
+        separate[1] = (separate[1] & 0x80) | 122;
+        engine.handle_input(3, Input::RelayPacket(&separate));
+        assert!(drain(&mut engine).is_empty());
+        assert_eq!(engine.audio_rx.audio_pt_rejected, 2);
+        assert_eq!(engine.audio_rx.last_rejected_pt, Some(122));
+
         // Right payload type, corrupt body: counted as an unprotect failure.
         let mut bad = protected.to_vec();
         *bad.last_mut().expect("non-empty packet") ^= 0xff;
         engine.handle_input(4, Input::RelayPacket(&bad));
         assert_eq!(engine.audio_rx.unprotect_failed, 1);
-        assert_eq!(engine.audio_rx.total, 3);
+        assert_eq!(engine.audio_rx.total, 4);
 
         // Neither STUN, RTCP nor RTP.
         engine.handle_input(5, Input::RelayPacket(&[0xff]));
@@ -5065,6 +5073,38 @@ mod tests {
             }
         }
         assert!(peak > 0, "decoded peer audio must reach the playout buffer");
+    }
+
+    // Backport of oxidezap/whatsapp-rust#1720 (receive side): MLOW on its own payload type (122)
+    // is decoded to PCM like the shared 120, and counted as accepted audio, not as rejected.
+    #[test]
+    fn mlow_on_its_separate_payload_type_is_decoded_to_pcm() {
+        let mut eng = engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut peer_tx = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: SSRC,
+            samples_per_packet: SAMPLES,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        assert!(peer_tx.set_audio_payload_type(crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE));
+        let tone = (0..SAMPLES as usize)
+            .map(|sample| 0.3 * (sample as f32 * 0.05).sin())
+            .collect::<Vec<_>>();
+        let frame = MlowEncoder::new().encode(&tone).expect("MLOW frame");
+        let packet = peer_tx.protect_audio(&frame);
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+
+        assert_eq!(eng.jitter_len(), SAMPLES as usize);
+        let stats = &eng.audio_rx;
+        assert_eq!((stats.audio_pt_rejected, stats.unprotect_failed), (0, 0));
+        assert_eq!((stats.unprotected, stats.mlow_decoded), (1, 1));
     }
 
     // End-to-end of the device-mismatch fix: an engine built for the dialed base callee LID receives

@@ -4,8 +4,8 @@ use bytes::Bytes;
 use wacore_binary::Jid;
 
 use super::rtp::{
-    RTP_PAYLOAD_TYPE_MLOW, RTP_PAYLOAD_TYPE_MLOW_RED, RTP_PAYLOAD_TYPE_OPUS,
-    RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO,
+    RTP_PAYLOAD_TYPE_MLOW, RTP_PAYLOAD_TYPE_MLOW_RED, RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
+    RTP_PAYLOAD_TYPE_OPUS, RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO,
 };
 
 /// Codec carried inside WhatsApp's audio RTP payload.
@@ -133,10 +133,15 @@ impl AudioFormat {
     pub const fn accepts_rtp_payload_type(self, payload_type: u8) -> bool {
         payload_type == self.rtp_payload_type
             || matches!(self.rtp_profile, AudioRtpProfile::Mlow)
-                && payload_type == RTP_PAYLOAD_TYPE_MLOW_RED
+                && (payload_type == RTP_PAYLOAD_TYPE_MLOW_RED
+                    || payload_type == RTP_PAYLOAD_TYPE_MLOW_SEPARATE)
     }
 
     /// Identify the actual inbound codec after the negotiated RTP profile is known.
+    ///
+    /// The separate MLOW type (`mlow-1`, 122) is read exactly like the shared one: its first byte is
+    /// an MLOW TOC, and the escape marker is no TOC any MLOW frame can have, so it means the same
+    /// thing on either. Only the redundancy type differs, because its first byte is RED framing.
     pub fn inbound_codec(self, payload_type: u8, payload: &[u8]) -> AudioCodec {
         match self.rtp_profile {
             AudioRtpProfile::StandardOpus => AudioCodec::Opus,
@@ -474,6 +479,37 @@ mod tests {
             AudioFormat::OPUS_MLOW_16KHZ_60MS.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_MLOW_RED)
         );
         assert!(!AudioFormat::OPUS_MLOW_16KHZ_60MS.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_OPUS));
+    }
+
+    // Backport of oxidezap/whatsapp-rust#1720 (receive side): a peer that takes capability 38,
+    // `enable_mlow_separate_pt_tx`, moves its MLOW frames to `mlow-1` (122). Read only as 120 and
+    // 121, its audio is discarded whole as an unexpected payload type.
+    #[test]
+    fn the_mlow_profile_takes_mlow_on_its_separate_payload_type() {
+        use crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE;
+        assert_eq!(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, 122);
+        for format in [
+            AudioFormat::MLOW_16KHZ_60MS,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+        ] {
+            assert!(format.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_MLOW_SEPARATE));
+            assert_eq!(
+                format.inbound_codec(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, &[0x50, 1, 2]),
+                AudioCodec::Mlow
+            );
+            // The escape marker is no MLOW TOC, so it means the same thing on 122 as on 120.
+            assert_eq!(
+                format.inbound_codec(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, &[0xF8, 1, 2]),
+                AudioCodec::Opus
+            );
+        }
+        // Standard Opus has no MLOW to carry: the type stays outside its profile.
+        for format in [
+            AudioFormat::OPUS_16KHZ_60MS,
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+        ] {
+            assert!(!format.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_MLOW_SEPARATE));
+        }
     }
 
     #[test]

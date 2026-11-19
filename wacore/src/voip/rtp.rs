@@ -12,6 +12,13 @@ pub const RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO: u8 = 120;
 pub const RTP_PAYLOAD_TYPE_MLOW: u8 = RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO;
 /// MLOW SplitRed redundancy payload type (`mlow-red-1`).
 pub const RTP_PAYLOAD_TYPE_MLOW_RED: u8 = 121;
+/// MLOW on a payload type of its own (`mlow-1`).
+///
+/// A sender moves its MLOW frames here, off the shared [`RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO`], once the
+/// call has enabled `enable_mlow_separate_pt_tx`: capability index 38, which a 1:1 video offer
+/// announces. A receiver that knows only 120 and 121 discards every such frame as an unexpected
+/// payload type. From oxidezap/whatsapp-rust#1720.
+pub const RTP_PAYLOAD_TYPE_MLOW_SEPARATE: u8 = 122;
 /// H.264 video payload type used by captured Android video RTP.
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
 /// RTC app-data stream carrying reactions and future in-call controls.
@@ -87,7 +94,10 @@ pub const OPUS_PRIMING_FRAME_2: [u8; 5] = [0x90, 0xb8, 0x14, 0x14, 0xc4];
 pub fn is_whatsapp_opus_rtp_payload(payload_type: u8) -> bool {
     matches!(
         payload_type,
-        RTP_PAYLOAD_TYPE_OPUS | RTP_PAYLOAD_TYPE_MLOW | RTP_PAYLOAD_TYPE_MLOW_RED
+        RTP_PAYLOAD_TYPE_OPUS
+            | RTP_PAYLOAD_TYPE_MLOW
+            | RTP_PAYLOAD_TYPE_MLOW_RED
+            | RTP_PAYLOAD_TYPE_MLOW_SEPARATE
     )
 }
 
@@ -593,6 +603,7 @@ mod tests {
         assert!(is_whatsapp_opus_rtp_payload(111));
         assert!(is_whatsapp_opus_rtp_payload(120));
         assert!(is_whatsapp_opus_rtp_payload(121));
+        assert!(is_whatsapp_opus_rtp_payload(122));
         assert!(!is_whatsapp_opus_rtp_payload(96));
     }
 
