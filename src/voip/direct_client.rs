@@ -97,10 +97,20 @@ impl DirectCallHost for Client {
         if let Some(lid) = self.lid_pn_cache.get_current_lid(&peer.user).await {
             return Ok(Jid::new(lid.as_str(), Server::Lid));
         }
-        self.signal()
-            .get_user_devices(std::slice::from_ref(peer))
+        // A devices-only usync does not teach the LID of a contact this account has never messaged:
+        // the server answers it with the PN and no LID. `is_on_whatsapp` carries the `lid` protocol
+        // and persists the mapping it gets back.
+        let results = self
+            .contacts()
+            .is_on_whatsapp(std::slice::from_ref(peer))
             .await
             .map_err(|error| CallError::Setup(error.to_string()))?;
+        if results
+            .iter()
+            .any(|r| r.jid.user == peer.user && !r.is_registered)
+        {
+            return Err(CallError::NotOnWhatsApp);
+        }
         self.lid_pn_cache
             .get_current_lid(&peer.user)
             .await
@@ -333,5 +343,86 @@ mod tests {
             &host.call_state().transition("DIRECT-LANE"),
             &client.answer_transition_lock("DIRECT-LANE"),
         ));
+    }
+
+    /// Run `resolve_peer` for a never-messaged PN against a scripted server that answers the one
+    /// usync with `user_children` (the children of its `<user>` node).
+    async fn resolve_pn_with_server_reply(
+        user_children: Vec<Node>,
+    ) -> (Arc<Client>, Result<Jid, CallError>) {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+
+        let (client, transport) = create_iq_test_client().await;
+        let pn_peer = Jid::new("559900000000", Server::Pn);
+        let task = {
+            let client = client.clone();
+            tokio::spawn(async move { DirectCallHost::resolve_peer(&*client, &pn_peer).await })
+        };
+        let request = decode_sent_iq(&transport, 0).await;
+        let id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("usync iq carries an id")
+            .into_owned();
+        assert!(
+            request
+                .get()
+                .get_optional_child_by_tag(&["usync", "query", "lid"])
+                .is_some(),
+            "the lookup must carry the lid protocol"
+        );
+        let response = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net".to_string()),
+                ("type", "result".to_string()),
+                ("id", id.clone()),
+            ])
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "559900000000@s.whatsapp.net")
+                        .children(user_children)
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        answer_iq(&client, &id, &response).await;
+        let result = task.await.expect("resolve task should not panic");
+        (client, result)
+    }
+
+    #[tokio::test]
+    async fn resolve_peer_learns_the_lid_of_a_never_messaged_pn() {
+        let (client, res) = resolve_pn_with_server_reply(vec![
+            NodeBuilder::new("contact").attr("type", "in").build(),
+            NodeBuilder::new("lid").attr("val", "100000001@lid").build(),
+        ])
+        .await;
+        assert_eq!(
+            res.expect("lid resolved"),
+            Jid::new("100000001", Server::Lid)
+        );
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_current_lid("559900000000")
+                .await
+                .as_deref(),
+            Some("100000001"),
+            "the mapping must be persisted for later calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_peer_reports_a_number_that_is_not_on_whatsapp() {
+        let (_client, res) = resolve_pn_with_server_reply(vec![
+            NodeBuilder::new("contact").attr("type", "out").build(),
+        ])
+        .await;
+        assert!(
+            matches!(res, Err(CallError::NotOnWhatsApp)),
+            "expected NotOnWhatsApp, got {res:?}"
+        );
     }
 }

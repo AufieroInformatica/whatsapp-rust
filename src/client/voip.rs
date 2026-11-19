@@ -1095,6 +1095,10 @@ pub enum CallError {
     #[cfg(feature = "voip-control")]
     #[error("video upgrade request is no longer current")]
     VideoUpgradeExpired,
+    /// The server says the callee's number is not registered on WhatsApp, so there is nobody to call.
+    #[cfg(feature = "voip-control")]
+    #[error("callee is not on WhatsApp")]
+    NotOnWhatsApp,
     /// `call(peer)` resolved zero devices for the peer (nothing to address an offer to).
     #[cfg(feature = "voip-control")]
     #[error("peer has no resolvable devices")]
