@@ -923,10 +923,14 @@ async fn run_call_with_clock_and_wallclock(
     // Only republished when a counter actually moved: comparing fifteen `u32`s is cheaper than
     // taking the lock, and on a healthy call only `rtp_received` and one decode counter ever move.
     let mut published_stats = crate::voip::media_stats::CallMediaStats::default();
+    let mut audio_rx_log = crate::voip::media_stats::AudioRxLog::default();
 
     'drive: loop {
         let stats = eng.media_stats();
         if stats != published_stats {
+            if !eng.is_group() {
+                audio_rx_log.poll(now_ms(), eng.call_id(), &published_stats, &stats);
+            }
             channels.media_stats.publish(stats);
             published_stats = stats;
         }

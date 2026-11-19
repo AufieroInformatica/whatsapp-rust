@@ -512,6 +512,71 @@ fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
 /// the watchdog says so rather than letting the codec thrash for the whole call.
 pub(crate) const CODEC_FLAP_LIMIT: u16 = 4;
 
+#[cfg(feature = "voip")]
+/// Minimum spacing of the periodic receive summary on the engine's clock.
+const AUDIO_RX_LOG_INTERVAL_MS: Millis = 2_000;
+
+#[cfg(feature = "voip")]
+/// Paces a 1:1 call's `wacore::voip::audio_rx` debug summary. A build without the `tracing`
+/// feature still has `log`, which is what the embedding bridge reads.
+#[derive(Debug, Default)]
+pub(crate) struct AudioRxLog {
+    last: Option<Millis>,
+}
+
+#[cfg(feature = "voip")]
+impl AudioRxLog {
+    /// Emit one summary if the counters moved since `then` and the interval has elapsed. Silent on
+    /// a call whose counters are not moving, so an idle ring prints nothing.
+    pub(crate) fn poll(
+        &mut self,
+        now: Millis,
+        call_id: &str,
+        then: &CallMediaStats,
+        stats: &CallMediaStats,
+    ) {
+        if self.due(now, then, stats) {
+            log::debug!(target: "wacore::voip::audio_rx", "{}", audio_rx_summary(call_id, stats));
+        }
+    }
+
+    fn due(&mut self, now: Millis, then: &CallMediaStats, stats: &CallMediaStats) -> bool {
+        if then == stats
+            || self
+                .last
+                .is_some_and(|last| now.saturating_sub(last) < AUDIO_RX_LOG_INTERVAL_MS)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
+#[cfg(feature = "voip")]
+fn audio_rx_summary(call_id: &str, s: &CallMediaStats) -> String {
+    format!(
+        "voip audio rx call_id={call_id} received={} decoded={} delivered={} rejected_pt={} \
+         last_rejected_pt={} unprotect_failed={} sframe_failed={} piggybacked_audio_received={} \
+         auxiliary_authenticated={} video_rtp={} unclassified={} envelope_rejected={} \
+         sink_dropped={} no_decoder={}",
+        s.rtp_received,
+        s.audio_frames_decoded,
+        s.audio_frames_delivered,
+        s.rtp_payload_type_unexpected,
+        s.last_unexpected_payload_type,
+        s.srtp_unprotect_failed,
+        s.sframe_decrypt_failed,
+        s.piggybacked_audio_received,
+        s.auxiliary_rtp_authenticated,
+        s.video_rtp_received,
+        s.relay_packet_unclassified,
+        s.forwarding_envelope_rejected,
+        s.audio_sink_dropped,
+        s.audio_frames_without_decoder,
+    )
+}
+
 #[cfg(all(test, feature = "voip"))]
 mod tests {
     use super::*;
@@ -891,5 +956,50 @@ mod tests {
             ),
             "a saturated counter must not turn a silent call quiet"
         );
+    }
+
+    #[test]
+    fn the_audio_rx_log_waits_for_movement_and_for_the_interval() {
+        let idle = CallMediaStats::default();
+        let moved = CallMediaStats {
+            rtp_received: 1,
+            ..CallMediaStats::default()
+        };
+        let mut log = AudioRxLog::default();
+        assert!(
+            !log.due(10_000, &idle, &idle),
+            "an idle call prints nothing"
+        );
+        assert!(
+            log.due(10_000, &idle, &moved),
+            "first movement prints at once"
+        );
+        assert!(!log.due(11_999, &idle, &moved), "inside 2000 ms");
+        assert!(
+            !log.due(12_000, &moved, &moved),
+            "interval over but nothing moved"
+        );
+        assert!(log.due(12_000, &idle, &moved));
+    }
+
+    #[test]
+    fn the_audio_rx_summary_names_the_counters_read_on_a_phone_test() {
+        let stats = CallMediaStats {
+            rtp_received: 7,
+            audio_frames_decoded: 5,
+            rtp_payload_type_unexpected: 2,
+            piggybacked_audio_received: 3,
+            ..CallMediaStats::default()
+        };
+        let line = audio_rx_summary("CID", &stats);
+        for part in [
+            "call_id=CID",
+            "received=7",
+            "decoded=5",
+            "rejected_pt=2",
+            "piggybacked_audio_received=3",
+        ] {
+            assert!(line.contains(part), "{part} missing from {line}");
+        }
     }
 }
