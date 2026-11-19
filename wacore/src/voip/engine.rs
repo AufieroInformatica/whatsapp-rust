@@ -460,6 +460,10 @@ pub enum GroupControlKind {
 pub enum CallEvent {
     /// The relay accepted our allocate (an allocate/binding success arrived); media path is live.
     RelayAllocated,
+    /// The callee's `<accept>` arrived for a 1:1 call. Relay allocation only says our media path is
+    /// up (it happens while the callee's phone may still be ringing, or never rang); this is the
+    /// signal that someone picked up, whichever device answered. Pushed by the signaling handler.
+    PeerAccepted,
     /// A standard Opus packet carried through MLOW's in-profile escape while PCM/MLOW I/O is
     /// selected. Shells with an Opus decoder can play it; codec selection still follows signaling.
     ForeignAudio(Bytes),
@@ -584,6 +588,7 @@ impl CallEvent {
                         .sum::<usize>()
             }
             Self::RelayAllocated
+            | Self::PeerAccepted
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut
             | Self::RelayReconnectTimedOut

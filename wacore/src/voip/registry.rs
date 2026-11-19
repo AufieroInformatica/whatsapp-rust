@@ -690,6 +690,19 @@ impl CallRegistry {
         tx.is_some_and(|tx| tx.force_send(event))
     }
 
+    /// Tell a 1:1 call's subscriber that the callee accepted. False, and nothing sent, for an
+    /// unknown call, a stale generation or a group call.
+    pub fn send_peer_accepted_if_current(&self, call_id: &str, generation: u64) -> bool {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .filter(|entry| entry.generation == generation && !entry.is_group_call)
+            .and_then(|entry| entry.event_tx.clone());
+        tx.is_some_and(|tx| tx.force_send(CallEvent::PeerAccepted))
+    }
+
     /// Atomically apply a newer authoritative group snapshot to an active call.
     pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
         self.apply_group_update_inner(update, None)
@@ -4588,6 +4601,22 @@ mod tests {
         drop(permit);
         assert!(reg.reserve_call_event("CID").is_some());
         assert!(reg.reserve_call_event("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn peer_accepted_reaches_only_the_current_one_to_one_call() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let (event_tx, event_rx) = async_channel::bounded(4);
+        let (ctl_tx, _ctl_rx) = video_control_channel();
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
+
+        assert!(!reg.send_peer_accepted_if_current("CID", generation + 1));
+        assert!(!reg.send_peer_accepted_if_current("UNKNOWN", generation));
+        assert!(event_rx.is_empty(), "stale or unknown must send nothing");
+
+        assert!(reg.send_peer_accepted_if_current("CID", generation));
+        assert!(matches!(event_rx.try_recv(), Ok(CallEvent::PeerAccepted)));
     }
 
     #[test]

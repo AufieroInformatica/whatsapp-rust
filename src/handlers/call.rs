@@ -380,6 +380,13 @@ impl StanzaHandler for CallHandler {
                         client
                             .call_registry()
                             .send_rekey(call.action.call_id(), sender.to_string());
+                        if let Some(generation) =
+                            client.call_registry().generation_of(call.action.call_id())
+                        {
+                            client
+                                .call_registry()
+                                .send_peer_accepted_if_current(call.action.call_id(), generation);
+                        }
                     }
                     // Caller-side multi-device dismiss: when one of the callee's devices accepts or
                     // rejects an outbound call of ours, tell the rest to stop ringing.
@@ -2874,6 +2881,10 @@ mod tests {
                 .await
         );
 
+        assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerAccepted)),
+            "a compatible accept only announces the accept"
+        );
         assert!(event_rx.try_recv().is_err());
         assert!(client.call_registry().snapshot("CALL-ID-0001").is_some());
         let fallback = client
