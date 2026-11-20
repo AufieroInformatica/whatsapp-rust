@@ -1167,7 +1167,7 @@ pub struct VideoStateParams<'a> {
     pub device_orientation: Option<u8>,
 }
 
-/// `<call to=peer id=wrapper><video call-id call-creator state=N [dec] [voip_settings="video"]
+/// `<call to=peer id=wrapper><video call-id call-creator state=N [dec]
 /// [device_orientation]/></call>` — the in-call video upgrade/downgrade handshake stanza.
 pub fn build_video_state(p: &VideoStateParams<'_>) -> Node {
     let mut action = NodeBuilder::new("video")
@@ -1177,9 +1177,7 @@ pub fn build_video_state(p: &VideoStateParams<'_>) -> Node {
     if let Some(dec) = p.dec {
         action = action.attr("dec", dec.to_string());
     }
-    if p.state == VideoState::UpgradeRequestV2 {
-        action = action.attr("voip_settings", "video");
-    }
+    // EXPERIMENT (AUL-1425): the upgrade request no longer carries `voip_settings="video"`.
     if let Some(o) = p.device_orientation {
         action = action.attr("device_orientation", o.to_string());
     }
@@ -3152,7 +3150,7 @@ mod tests {
     }
 
     #[test]
-    fn build_video_state_upgrade_carries_marker_downgrade_does_not() {
+    fn build_video_state_upgrade_and_downgrade_carry_no_voip_settings() {
         let peer = peer();
         let creator = creator();
         let upgrade = build_video_state(&VideoStateParams {
@@ -3185,9 +3183,9 @@ mod tests {
             Some("H264")
         );
         assert_eq!(
-            action.attrs().optional_string("voip_settings").as_deref(),
-            Some("video"),
-            "the upgrade request must carry the marker attr"
+            action.attrs().optional_string("voip_settings"),
+            None,
+            "experiment: the upgrade request carries no voip_settings marker"
         );
 
         let downgrade = build_video_state(&VideoStateParams {

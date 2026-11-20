@@ -4529,7 +4529,7 @@ impl CallHandle {
     }
 
     /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
-    /// and sends `<video state=11 dec="H264" device_orientation="0" voip_settings="video">`.
+    /// and sends `<video state=11 dec="H264" device_orientation="0">`.
     /// The peer answers with
     /// `UpgradeAccept`/`Enabled` (surfaced as [`CallEvent::PeerVideoStateChanged`]); media flows as
     /// soon as both planes are up. Also the way to start media on a `.video()` call whose builder
@@ -12880,9 +12880,9 @@ mod tests {
             Some("0")
         );
         assert_eq!(
-            ar.attrs().optional_string("voip_settings").as_deref(),
-            Some("video"),
-            "the upgrade request must carry the marker attr"
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "experiment: the upgrade request carries no voip_settings marker"
         );
         assert!(
             client
@@ -12927,9 +12927,9 @@ mod tests {
             Some("0")
         );
         assert_eq!(
-            ar.attrs().optional_string("voip_settings").as_deref(),
-            Some("video"),
-            "the re-request must carry the marker attr like the initial request"
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "experiment: the re-request carries no voip_settings marker either"
         );
         handle.hangup_local().await;
     }

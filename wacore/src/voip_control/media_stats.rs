@@ -554,6 +554,41 @@ impl AudioRxLog {
 }
 
 #[cfg(feature = "voip")]
+/// Remembers the payload type and MLOW rate mode of the peer's audio and says so when either
+/// changes, which is the first frame of a call too. The rate mode is the TOC's low_rate bit.
+#[derive(Debug, Default)]
+pub(crate) struct AudioRxPayloadWatch {
+    seen: Option<(u8, Option<bool>)>,
+}
+
+#[cfg(feature = "voip")]
+impl AudioRxPayloadWatch {
+    /// The new `(payload_type, low_rate)` when it differs from the last one seen, `None` otherwise.
+    /// `toc` is the first byte of an MLOW frame, or `None` for any other codec.
+    pub(crate) fn changed(
+        &mut self,
+        payload_type: u8,
+        toc: Option<u8>,
+    ) -> Option<(u8, Option<bool>)> {
+        let now = (payload_type, toc.map(|b| (b >> 2) & 1 != 0));
+        if self.seen == Some(now) {
+            return None;
+        }
+        self.seen = Some(now);
+        Some(now)
+    }
+
+    pub(crate) fn observe(&mut self, call_id: &str, payload_type: u8, toc: Option<u8>) {
+        if let Some((pt, low_rate)) = self.changed(payload_type, toc) {
+            log::debug!(
+                target: "wacore::voip::audio_rx",
+                "voip audio rx payload call_id={call_id} payload_type={pt} low_rate={low_rate:?}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "voip")]
 fn audio_rx_summary(call_id: &str, s: &CallMediaStats) -> String {
     format!(
         "voip audio rx call_id={call_id} received={} decoded={} delivered={} rejected_pt={} \
@@ -980,6 +1015,17 @@ mod tests {
             "interval over but nothing moved"
         );
         assert!(log.due(12_000, &idle, &moved));
+    }
+
+    #[test]
+    fn the_payload_watch_speaks_on_the_first_frame_and_on_each_change_only() {
+        let mut w = AudioRxPayloadWatch::default();
+        assert_eq!(w.changed(120, Some(0x50)), Some((120, Some(false))));
+        assert_eq!(w.changed(120, Some(0x50)), None);
+        assert_eq!(w.changed(120, Some(0x12)), None, "same rate mode");
+        assert_eq!(w.changed(120, Some(0x54)), Some((120, Some(true))));
+        assert_eq!(w.changed(122, Some(0x54)), Some((122, Some(true))));
+        assert_eq!(w.changed(122, None), Some((122, None)));
     }
 
     #[test]

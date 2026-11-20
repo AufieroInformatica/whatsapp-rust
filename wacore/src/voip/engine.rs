@@ -30,7 +30,9 @@ use super::group_media::{
     GroupRosterApply, group_device_is_local,
 };
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
-use super::media_stats::{AudioHealthAlarm, AudioHealthWatch, CODEC_FLAP_LIMIT, CallMediaStats};
+use super::media_stats::{
+    AudioHealthAlarm, AudioHealthWatch, AudioRxPayloadWatch, CODEC_FLAP_LIMIT, CallMediaStats,
+};
 // Re-exported for the engine's tests and for callers that name the silence reason from this module;
 // the type itself lives in the neutral contract.
 use super::fec::RTP_PAYLOAD_TYPE_VIDEO_FEC;
@@ -1204,6 +1206,8 @@ pub struct CallEngine {
     allocate_transaction_id: Option<[u8; 12]>,
     tx_ids: Box<dyn TxIdSource>,
     keepalive_deadline: Millis,
+    /// Which payload type and MLOW rate mode the peer's audio is in, logged when either changes.
+    audio_rx_payload: AudioRxPayloadWatch,
     /// Next RTCP Sender-Report tick (NEVER until the relay allocates).
     rtcp_deadline: Millis,
     /// Mapping injected at start so SR NTP timestamps use wall time while scheduling stays monotonic.
@@ -1394,6 +1398,7 @@ impl CallEngine {
             allocate_transaction_id: None,
             tx_ids,
             keepalive_deadline: 0,
+            audio_rx_payload: AudioRxPayloadWatch::default(),
             rtcp_deadline: NEVER,
             rtcp_monotonic_origin: 0,
             rtcp_wallclock_origin_ms: 0,
@@ -3700,6 +3705,13 @@ impl CallEngine {
             Some(SframeIn::AuthFailed | SframeIn::Plaintext) | None => payload,
         };
         let codec = m.active_format.inbound_codec(header.payload_type, &encoded);
+        if !unauthenticated {
+            let toc = (codec == AudioCodec::Mlow)
+                .then(|| encoded.first().copied())
+                .flatten();
+            self.audio_rx_payload
+                .observe(&self.call_id, header.payload_type, toc);
+        }
         // Asked HERE, before the Opus branch returns. That branch decodes inbound audio perfectly
         // well without the call-wide format ever moving, which leaves `on_mic` encoding MLOW at a
         // peer that speaks native Opus: inbound fine, outbound silent, and no counter describing it
