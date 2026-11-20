@@ -1442,8 +1442,10 @@ pub(super) fn keep_non_pkmsg_devices(
     Ok(kept)
 }
 
-pub(crate) use wacore::voip_control::signaling_plan::offer_capability;
 use wacore::voip_control::signaling_plan::{NegotiatedAudioPlan, peer_selected_codec_from_offer};
+pub(crate) use wacore::voip_control::signaling_plan::{
+    offer_capability, one_to_one_offer_capability,
+};
 
 fn negotiated_audio_plan(
     configured: AudioFormat,
@@ -2029,7 +2031,7 @@ async fn place_call_prepared(
         call_creator,
         device_keys: &device_keys,
         privacy_token: privacy_token.as_deref(),
-        capability: Some(offer_capability(video.is_some(), audio.config().format)),
+        capability: Some(one_to_one_offer_capability(audio.config().format)),
         device_identity: device_identity.as_deref(),
         id: Some(&offer_stanza_id),
         // Keep the addressed `<destination>` shape for a multi-device callee even if encryption

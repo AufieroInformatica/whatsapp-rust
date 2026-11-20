@@ -23,6 +23,13 @@ pub enum AudioPlanError {
     },
 }
 
+/// EXPERIMENT (AUL-1425): the capability blob a 1:1 `<offer>` carries. An audio offer sends the
+/// video offer's blob too, which differs only in capability index 38 (`enable_mlow_separate_pt_tx`),
+/// so a call that is later upgraded to video was negotiated like one that started as video.
+pub fn one_to_one_offer_capability(audio: AudioFormat) -> &'static [u8] {
+    offer_capability(true, audio)
+}
+
 pub fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
     let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
     match (video, standard_opus) {
@@ -193,4 +200,46 @@ pub fn build_answer_signaling(
             .and_then(|offer| offer.peer_abtest_bucket_id_list.as_deref()),
     });
     Some((preaccept, accept))
+}
+
+#[cfg(test)]
+mod one_to_one_offer_capability_tests {
+    use super::*;
+    use crate::stanza::call::{CAPABILITY_OFFER, CapabilityBit, capability_bit};
+    use crate::voip_control::MediaAudioFormat as AudioFormat;
+
+    /// Capability index 38, `enable_mlow_separate_pt_tx`.
+    const SEPARATE_PT_TX: u32 = 38;
+
+    #[test]
+    fn a_one_to_one_offer_carries_the_video_offer_blob_even_without_video() {
+        let blob = one_to_one_offer_capability(AudioFormat::MLOW_16KHZ_60MS);
+        assert_eq!(blob, &CAPABILITY_VIDEO_OFFER);
+        assert_eq!(
+            capability_bit(Some(1), blob, SEPARATE_PT_TX),
+            CapabilityBit::Set
+        );
+    }
+
+    #[test]
+    fn the_plain_audio_blob_does_not_announce_separate_payload_types() {
+        assert_eq!(
+            capability_bit(Some(1), &CAPABILITY_OFFER, SEPARATE_PT_TX),
+            CapabilityBit::Clear
+        );
+        assert_eq!(
+            offer_capability(false, AudioFormat::MLOW_16KHZ_60MS),
+            &CAPABILITY_OFFER,
+            "group call devices keep the audio blob"
+        );
+    }
+
+    #[test]
+    fn the_blobs_differ_only_in_the_separate_payload_type_bit() {
+        let diff: Vec<usize> = (0..CAPABILITY_OFFER.len())
+            .filter(|&i| CAPABILITY_OFFER[i] != CAPABILITY_VIDEO_OFFER[i])
+            .collect();
+        assert_eq!(diff, [6]);
+        assert_eq!(CAPABILITY_OFFER[6] ^ CAPABILITY_VIDEO_OFFER[6], 0x40);
+    }
 }
