@@ -58,8 +58,19 @@ pub(crate) trait Subsystem: 'static {
     ) {
     }
 
+    /// Runs as a connection ends, just before its state is torn down. `will_reconnect` says the
+    /// supervision loop is going to dial again, as opposed to a logout, a replaced stream, a ban or
+    /// a shutdown. Synchronous, and only a note for the cleanup that follows it.
+    fn on_connection_ending(_client: &Client, _will_reconnect: bool) {}
+
     /// Runs while a connection's state is torn down, before the socket closes.
     async fn on_connection_cleanup(_client: &Client) {}
+
+    /// Runs when a connection is announced as connected, after login.
+    fn on_connected(_client: &Client) {}
+
+    /// Runs when the supervision loop ends, so no connection is coming back.
+    fn on_session_ended(_client: &Client) {}
 
     /// Sees a response before the waiter it belongs to is woken. On the ack
     /// path and synchronous, so an implementation has to stay cheap; the point
@@ -141,6 +152,33 @@ macro_rules! subsystems {
                 }
             )*
             false
+        }
+
+        /// Tells every attached subsystem how the connection that is ending will be followed.
+        #[allow(unused_variables)]
+        pub(crate) fn on_connection_ending(client: &Client, will_reconnect: bool) {
+            $(
+                $(#[$attr])*
+                <$subsystem as Subsystem>::on_connection_ending(client, will_reconnect);
+            )*
+        }
+
+        /// Tells every attached subsystem a connection was announced as connected.
+        #[allow(unused_variables)]
+        pub(crate) fn on_connected(client: &Client) {
+            $(
+                $(#[$attr])*
+                <$subsystem as Subsystem>::on_connected(client);
+            )*
+        }
+
+        /// Tells every attached subsystem the supervision loop ended.
+        #[allow(unused_variables)]
+        pub(crate) fn on_session_ended(client: &Client) {
+            $(
+                $(#[$attr])*
+                <$subsystem as Subsystem>::on_session_ended(client);
+            )*
         }
 
         /// Lets every attached subsystem release what one connection owned.

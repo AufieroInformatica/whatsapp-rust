@@ -139,6 +139,18 @@ pub enum CallEvent {
     },
     /// Audio RTP has stopped arriving.
     AudioReceptionStalled { silent_for_ms: Millis },
+    /// The signaling connection dropped while this call's media kept running. Signaling stanzas
+    /// for the call (a hangup, a mute, a video request) neither arrive nor leave until
+    /// [`SignalingResumed`](Self::SignalingResumed), and the call ends with
+    /// [`SignalingResumeTimedOut`](Self::SignalingResumeTimedOut) if that never happens.
+    SignalingSuspended,
+    /// Signaling is back and the call's signaling routes through the new connection.
+    SignalingResumed,
+    /// Signaling did not come back within the deadline, so the call is ending. Terminal.
+    ///
+    /// Distinct from the peer hanging up: nothing was heard from the peer, our own connection to
+    /// WhatsApp is what failed.
+    SignalingResumeTimedOut,
     /// The media session closed, with why.
     ///
     /// Raised by a backend when its media ends; a signaling-driven teardown produces it through the
@@ -205,7 +217,9 @@ impl CallEvent {
                 MediaCloseReason::SendFailed(reason) | MediaCloseReason::SetupFailed(reason) => {
                     reason.capacity()
                 }
-                MediaCloseReason::Local | MediaCloseReason::RelayDisconnected => 0,
+                MediaCloseReason::Local
+                | MediaCloseReason::RelayDisconnected
+                | MediaCloseReason::SignalingLost => 0,
             },
             Self::PeerVideoStateChanged {
                 source,
@@ -224,7 +238,10 @@ impl CallEvent {
             | Self::AudioSilent { .. }
             | Self::AudioCodecSwitched { .. }
             | Self::AudioCodecSourceIsFixed { .. }
-            | Self::AudioReceptionStalled { .. } => 0,
+            | Self::AudioReceptionStalled { .. }
+            | Self::SignalingSuspended
+            | Self::SignalingResumed
+            | Self::SignalingResumeTimedOut => 0,
         }
     }
 }

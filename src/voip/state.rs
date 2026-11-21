@@ -44,9 +44,43 @@ impl Subsystem for Voip {
 
     const NAME: &'static str = "voip";
 
-    /// The relay socket and signaling are connection-scoped, so no call
-    /// survives a disconnect or reconnect.
+    fn on_connection_ending(client: &Client, will_reconnect: bool) {
+        client
+            .voip_state()
+            .direct
+            .signaling_expected_back
+            .store(will_reconnect, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Signaling is connection-scoped, so a call that has not reached live media ends with its
+    /// connection. A call whose relay session is up does not need the socket to carry audio, so
+    /// when the supervision loop is about to reconnect it is suspended instead and re-attached by
+    /// [`on_connected`](Self::on_connected); everything that is not a plain reconnect (logout,
+    /// replaced stream, ban, shutdown) still ends every call here and now.
     async fn on_connection_cleanup(client: &Client) {
+        let expected_back = client
+            .voip_state()
+            .direct
+            .signaling_expected_back
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            && !client.shutdown_signal().is_fired();
+        let host = expected_back
+            .then(|| client.self_weak.get().and_then(std::sync::Weak::upgrade))
+            .flatten();
+        match host {
+            Some(host) => {
+                let host: Arc<dyn super::direct::DirectCallHost> = host;
+                super::direct::suspend_signaling(&host, super::direct::SIGNALING_RESUME_TIMEOUT);
+            }
+            None => super::direct::disconnect(client),
+        }
+    }
+
+    fn on_connected(client: &Client) {
+        super::direct::resume_signaling(client);
+    }
+
+    fn on_session_ended(client: &Client) {
         super::direct::disconnect(client);
     }
 
@@ -146,5 +180,121 @@ impl Client {
     /// `Client::voip()` is already the public facade accessor.
     pub(crate) fn voip_state(&self) -> &VoipState {
         self.subsystem::<Voip>()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::sync::Arc;
+
+    use wacore::voip_control::{CallPhase, CallSession};
+    use wacore_binary::{Jid, Server};
+
+    use crate::client::{Client, subsystem};
+
+    /// A call whose media is live, registered straight into the client's call registry.
+    async fn client_with_live_call() -> Arc<Client> {
+        let client = crate::test_utils::create_test_client().await;
+        let registry = client.voip_state().direct.registry().clone();
+        let generation = registry.insert(CallSession::new_outgoing(
+            "LIVE",
+            Jid::new("222222222222222", Server::Lid),
+            Jid::new("111111111111111", Server::Lid),
+        ));
+        assert!(registry.transition_if_current("LIVE", generation, CallPhase::Calling));
+        assert!(registry.direct_media_connected_if_current("LIVE", generation));
+        client
+    }
+
+    fn call_alive(client: &Client) -> bool {
+        client
+            .voip_state()
+            .direct
+            .registry()
+            .generation_of("LIVE")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_will_be_replaced_leaves_a_live_call_suspended() {
+        let client = client_with_live_call().await;
+
+        subsystem::on_connection_ending(&client, true);
+        client.cleanup_connection_state().await;
+
+        assert!(call_alive(&client));
+        assert!(
+            client
+                .voip_state()
+                .direct
+                .registry()
+                .is_signaling_suspended("LIVE")
+        );
+
+        subsystem::on_connected(&client);
+        assert!(call_alive(&client));
+        assert!(
+            !client
+                .voip_state()
+                .direct
+                .registry()
+                .is_signaling_suspended("LIVE")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_will_not_be_replaced_ends_the_call_at_once() {
+        let client = client_with_live_call().await;
+
+        subsystem::on_connection_ending(&client, false);
+        client.cleanup_connection_state().await;
+
+        assert!(!call_alive(&client), "a logout, a ban or a conflict");
+    }
+
+    #[tokio::test]
+    async fn cleanup_without_a_verdict_from_the_run_loop_ends_the_call() {
+        let client = client_with_live_call().await;
+
+        client.cleanup_connection_state().await;
+
+        assert!(
+            !call_alive(&client),
+            "only a connection the run loop says will be replaced is waited for"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_expectation_does_not_outlive_the_cleanup_it_was_for() {
+        let client = client_with_live_call().await;
+        subsystem::on_connection_ending(&client, true);
+        subsystem::on_connection_ending(&client, false);
+
+        client.cleanup_connection_state().await;
+
+        assert!(!call_alive(&client));
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_the_call_even_when_a_reconnect_was_expected() {
+        let client = client_with_live_call().await;
+        subsystem::on_connection_ending(&client, true);
+        client.signal_shutdown_sync();
+
+        client.cleanup_connection_state().await;
+
+        assert!(!call_alive(&client));
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_run_loop_ends_a_suspended_call() {
+        let client = client_with_live_call().await;
+        subsystem::on_connection_ending(&client, true);
+        client.cleanup_connection_state().await;
+        assert!(call_alive(&client));
+
+        subsystem::on_session_ended(&client);
+
+        assert!(!call_alive(&client), "no connection is coming back");
     }
 }

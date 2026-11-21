@@ -2207,6 +2207,9 @@ fn client_weak(client: &Client) -> std::sync::Weak<Client> {
         .unwrap_or_else(std::sync::Weak::new)
 }
 
+/// How often a hangup on a call with no signaling connection checks whether it is back.
+const SIGNALING_WAIT_POLL: Duration = Duration::from_millis(50);
+
 /// Time to wait for the server's `<ack type=offer>` carrying the relay before giving up.
 const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -5210,6 +5213,14 @@ impl CallHandle {
             call_id: &self.call_id,
             generation: self.generation,
         };
+        // A call whose signaling connection is down has no way to tell the peer. Wait for the
+        // connection to return, or for the call to end at its own deadline, rather than tearing the
+        // call down silently and leaving the peer's phone in a call that is gone.
+        while self.client_registry.is_signaling_suspended(&self.call_id)
+            && self.client_registry.generation_of(&self.call_id) == Some(self.generation)
+        {
+            client.runtime().sleep(SIGNALING_WAIT_POLL).await;
+        }
         // The answer-transition lane, held across the check AND the send: a replacement installed in
         // that window would be ended by a `<terminate>` the peer cannot tell apart from ours, since
         // both carry the same call-id.

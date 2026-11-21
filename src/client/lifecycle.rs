@@ -483,6 +483,7 @@ impl Client {
             return;
         }
         wacore::telemetry::set_connected(true);
+        subsystem::on_connected(self);
         let app_version_fallback = self
             .app_version_fallback
             .lock()
@@ -1219,6 +1220,7 @@ impl Client {
                 }
             }
         }
+        subsystem::on_session_ended(self);
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
         client_log!(self, info, "Client run loop has shut down.");
@@ -1493,8 +1495,19 @@ impl Client {
             }
         };
 
+        // The same question the run loop asks below, answered before cleanup so a subsystem can
+        // keep what survives a reconnect. A terminal verdict (logout, conflict, ban), a shutdown, a
+        // pause and a disabled reconnect preference are all "no", and the answer is withdrawn once
+        // cleanup is done so it cannot leak into the next one.
+        let will_reconnect = terminal_reason.is_none()
+            && !self.shutdown_signal().is_fired()
+            && self.driver_running(Ordering::Relaxed)
+            && !self.is_paused()
+            && self.auto_reconnect_enabled();
+        subsystem::on_connection_ending(self, will_reconnect);
         self.cleanup_connection_state_requested(CleanupRequest::Owner(owner))
             .await;
+        subsystem::on_connection_ending(self, false);
 
         // Dispatch after cleanup so handlers see cleared connection state.
         if let Some(reason) = unexpected_disconnect.clone() {
@@ -3397,6 +3410,134 @@ mod tests {
         assert!(
             matches!(reason, Some(DisconnectReason::StreamEnded)),
             "an unannounced close must come back as the reason, got {reason:?}"
+        );
+    }
+
+    #[cfg(feature = "voip-control")]
+    fn register_live_call(client: &Client) {
+        use wacore::voip_control::{CallPhase, CallSession};
+        let registry = client.voip_state().direct.registry().clone();
+        let generation = registry.insert(CallSession::new_outgoing(
+            "LIVE",
+            Jid::new("222222222222222", wacore_binary::Server::Lid),
+            Jid::new("111111111111111", wacore_binary::Server::Lid),
+        ));
+        assert!(registry.transition_if_current("LIVE", generation, CallPhase::Calling));
+        assert!(registry.direct_media_connected_if_current("LIVE", generation));
+    }
+
+    #[cfg(feature = "voip-control")]
+    fn live_call_survives(client: &Client) -> bool {
+        client
+            .voip_state()
+            .direct
+            .registry()
+            .generation_of("LIVE")
+            .is_some()
+    }
+
+    /// The case this exists for: the server closes the socket and the run loop will dial again.
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn a_server_close_the_run_loop_will_reconnect_from_keeps_a_live_call() {
+        let fixture = PendingFrame::new().await;
+        register_live_call(&fixture.client);
+        fixture
+            .events
+            .send(crate::transport::TransportEvent::Disconnected(
+                DisconnectReason::StreamEnded,
+            ))
+            .await
+            .expect("the fixture channel must accept the close");
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .client
+                .connection_for_test()
+                .read_until_disconnected(),
+        )
+        .await
+        .expect("reading must end once the transport reports the close");
+
+        assert!(matches!(reason, Some(DisconnectReason::StreamEnded)));
+        assert!(live_call_survives(&fixture.client));
+        assert!(
+            fixture
+                .client
+                .voip_state()
+                .direct
+                .registry()
+                .is_signaling_suspended("LIVE")
+        );
+        subsystem::on_connected(&fixture.client);
+        assert!(
+            !fixture
+                .client
+                .voip_state()
+                .direct
+                .registry()
+                .is_signaling_suspended("LIVE")
+        );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn a_close_with_reconnect_disabled_ends_a_live_call() {
+        let fixture = PendingFrame::new().await;
+        register_live_call(&fixture.client);
+        fixture.client.set_auto_reconnect(false);
+        fixture
+            .events
+            .send(crate::transport::TransportEvent::Disconnected(
+                DisconnectReason::StreamEnded,
+            ))
+            .await
+            .expect("the fixture channel must accept the close");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .client
+                .connection_for_test()
+                .read_until_disconnected(),
+        )
+        .await
+        .expect("reading must end once the transport reports the close");
+
+        assert!(!live_call_survives(&fixture.client));
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn a_terminal_stream_error_ends_a_live_call_at_once() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        register_live_call(&client);
+        client
+            .send_node(NodeBuilder::new("stream:error").attr("code", "401").build())
+            .await
+            .expect("the terminal fixture frame must reach the mock transport");
+        crate::test_utils::poll_until("the terminal fixture frame to be written", || {
+            transport.sent_count() >= 1
+        })
+        .await;
+        let frame = transport.sent().remove(0);
+        let (events, receiver) = async_channel::bounded(2);
+        *client.transport_events.lock().await = Some(receiver);
+        events
+            .send(crate::transport::TransportEvent::DataReceived(frame))
+            .await
+            .expect("the fixture channel must accept the terminal frame");
+
+        let end = client
+            .connection_for_test()
+            .read_until_disconnected_with_outcome()
+            .await;
+
+        assert!(end.terminal_reason.is_some());
+        assert!(
+            !live_call_survives(&client),
+            "a logout, a ban or a replaced stream is not a call that can wait"
         );
     }
 

@@ -888,3 +888,304 @@ async fn a_synchronous_disconnect_in_ack_registration_cannot_publish_a_stale_off
     }
     host.assert_empty();
 }
+
+const RESUME_WITHIN: std::time::Duration = std::time::Duration::from_millis(150);
+
+fn peer_terminate_node() -> Node {
+    NodeBuilder::new("call")
+        .attr("from", peer())
+        .attr("id", "PEER-TERMINATE")
+        .attr("t", "1700000100")
+        .children([NodeBuilder::new("terminate")
+            .attr("call-id", "DIRECT-INCOMING")
+            .attr("call-creator", peer())
+            .build()])
+        .build()
+}
+
+async fn live_call(host: &Arc<Host>) -> super::CallHandle {
+    let (source, sink) = ports();
+    let handle = direct::accept_pcm(host.clone(), &incoming(), source, sink)
+        .await
+        .expect("accept");
+    assert!(handle.media_connected());
+    handle
+}
+
+fn ended(handle: &super::CallHandle) -> bool {
+    futures::FutureExt::now_or_never(handle.wait_ended()).is_some()
+}
+
+fn as_dyn(host: &Arc<Host>) -> Arc<dyn DirectCallHost> {
+    host.clone()
+}
+
+/// What the socket dropping does to the host: nothing can be sent until it is back.
+fn drop_socket(host: &Arc<Host>) {
+    host.connected.store(false, Ordering::Release);
+    host.fail_send.store(true, Ordering::Release);
+}
+
+fn restore_socket(host: &Arc<Host>) {
+    host.fail_send.store(false, Ordering::Release);
+    host.connected.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+async fn a_signaling_loss_does_not_end_a_call_with_live_media() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    let mut events = handle.take_events().expect("events");
+    drop_socket(&host);
+
+    let outcome = direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+
+    assert_eq!((outcome.kept, outcome.ended), (1, 0));
+    assert!(!ended(&handle), "the call must outlive the socket");
+    assert!(handle.media_connected());
+    assert!(
+        host.backend.sessions.sessions()[0]
+            .record()
+            .closed
+            .is_none(),
+        "live media is left running"
+    );
+    assert!(matches!(
+        events.try_recv(),
+        Ok(wacore::voip_control::CallEvent::SignalingSuspended)
+    ));
+    assert!(
+        host.state
+            .registry()
+            .is_signaling_suspended("DIRECT-INCOMING")
+    );
+}
+
+#[tokio::test]
+async fn after_the_reconnect_a_peer_terminate_still_ends_the_call() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    let mut events = handle.take_events().expect("events");
+    drop_socket(&host);
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+    restore_socket(&host);
+
+    assert_eq!(direct::resume_signaling(&*host), 1);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(wacore::voip_control::CallEvent::SignalingSuspended)
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Ok(wacore::voip_control::CallEvent::SignalingResumed)
+    ));
+    assert!(!ended(&handle));
+
+    let end = peer_terminate_node();
+    direct::ingest(host.clone(), &end.as_node_ref())
+        .await
+        .expect("peer terminate");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        .await
+        .expect("the peer's terminate ends the resumed call");
+    host.assert_empty();
+}
+
+#[tokio::test]
+async fn our_hangup_after_the_reconnect_goes_out_on_the_new_connection() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    drop_socket(&host);
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+    restore_socket(&host);
+    direct::resume_signaling(&*host);
+    let sent_before = host.sent.lock().unwrap().len();
+
+    assert!(matches!(
+        handle.terminate().await,
+        super::CallTermination::PeerNotified
+    ));
+
+    let sent = host.sent.lock().unwrap();
+    let terminate = sent[sent_before..]
+        .iter()
+        .find(|node| node.as_node_ref().get_optional_child("terminate").is_some())
+        .expect("a terminate was sent after the reconnect");
+    assert_eq!(
+        terminate
+            .as_node_ref()
+            .get_optional_child("terminate")
+            .unwrap()
+            .get_attr("call-id")
+            .unwrap()
+            .as_str(),
+        "DIRECT-INCOMING"
+    );
+    drop(sent);
+    assert!(ended(&handle));
+    host.assert_empty();
+}
+
+#[tokio::test]
+async fn no_reconnect_within_the_deadline_ends_the_call_with_its_own_reason() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    let mut events = handle.take_events().expect("events");
+    drop_socket(&host);
+
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait_ended())
+        .await
+        .expect("the deadline ends the call");
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    assert_eq!(
+        seen,
+        [
+            wacore::voip_control::CallEvent::SignalingSuspended,
+            wacore::voip_control::CallEvent::SignalingResumeTimedOut,
+        ],
+        "a peer hangup would have produced neither"
+    );
+    assert_eq!(
+        host.backend.sessions.sessions()[0].record().closed,
+        Some(wacore::voip_control::MediaCloseReason::SignalingLost)
+    );
+    host.assert_empty();
+}
+
+#[tokio::test]
+async fn a_reconnect_before_the_deadline_cancels_it() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    drop_socket(&host);
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN);
+    restore_socket(&host);
+    direct::resume_signaling(&*host);
+
+    tokio::time::sleep(RESUME_WITHIN * 3).await;
+
+    assert!(
+        !ended(&handle),
+        "a resumed call must not meet the old deadline"
+    );
+    assert!(
+        host.state
+            .registry()
+            .generation_of("DIRECT-INCOMING")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_logout_after_the_loss_ends_the_call_at_once() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    drop_socket(&host);
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+
+    direct::disconnect(&*host);
+
+    assert!(
+        ended(&handle),
+        "a hard disconnect does not wait for any deadline"
+    );
+    assert_eq!(
+        host.backend.sessions.sessions()[0].record().closed,
+        Some(wacore::voip_control::MediaCloseReason::RelayDisconnected)
+    );
+    host.assert_empty();
+}
+
+#[tokio::test]
+async fn a_call_still_negotiating_its_relay_does_not_survive_a_signaling_loss() {
+    let host = Host::new();
+    let (source, sink) = ports();
+    let handle = direct::call_pcm(host.clone(), &peer(), source, sink)
+        .await
+        .expect("call");
+    assert!(!handle.media_connected());
+    drop_socket(&host);
+
+    let outcome = direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+
+    assert_eq!((outcome.kept, outcome.ended), (0, 1));
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle.wait_ended())
+        .await
+        .expect("a dormant call ends with the socket, as it always did");
+    host.released_rx
+        .recv()
+        .await
+        .expect("the loss wakes the response wait");
+    host.assert_empty();
+}
+
+#[tokio::test]
+async fn an_operation_begun_before_the_loss_cannot_finish_after_it() {
+    let host = Host::new();
+    let epoch = host.state.epoch();
+    drop_socket(&host);
+
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+
+    assert!(
+        host.state.ensure_epoch(epoch).is_err(),
+        "call setup that spanned the loss is still fenced out"
+    );
+}
+
+#[tokio::test]
+async fn a_hangup_while_signaling_is_down_is_sent_once_it_is_back() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    drop_socket(&host);
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN * 100);
+    let sent_before = host.sent.lock().unwrap().len();
+    let hanging_up = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.terminate().await }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    assert!(
+        !hanging_up.is_finished(),
+        "nothing can be told to the peer yet"
+    );
+    assert_eq!(host.sent.lock().unwrap().len(), sent_before);
+    assert!(!ended(&handle));
+
+    restore_socket(&host);
+    direct::resume_signaling(&*host);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), hanging_up)
+        .await
+        .expect("the hangup completes once signaling is back")
+        .expect("task");
+    assert!(matches!(outcome, super::CallTermination::PeerNotified));
+    assert!(
+        host.sent.lock().unwrap()[sent_before..]
+            .iter()
+            .any(|node| node.as_node_ref().get_optional_child("terminate").is_some())
+    );
+    assert!(ended(&handle));
+    host.assert_empty();
+}
+
+#[tokio::test]
+async fn a_hangup_that_outlasts_the_deadline_finds_the_call_already_ended() {
+    let host = Host::new();
+    let handle = live_call(&host).await;
+    drop_socket(&host);
+    direct::suspend_signaling(&as_dyn(&host), RESUME_WITHIN);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle.terminate())
+        .await
+        .expect("the hangup does not wait past the call's own end");
+
+    assert!(matches!(outcome, super::CallTermination::AlreadyEnded));
+    host.assert_empty();
+}

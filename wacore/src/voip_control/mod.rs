@@ -516,6 +516,8 @@ pub enum MediaCloseReason {
     SendFailed(String),
     /// Media never came up.
     SetupFailed(String),
+    /// Signaling was lost and did not come back in time, so a call that outlived it ended.
+    SignalingLost,
 }
 
 /// Why a media session could not be opened.

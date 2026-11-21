@@ -6,6 +6,7 @@ use async_lock::Mutex as AsyncMutex;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use wacore::message_processing::EncType;
 use wacore::runtime::{BoxFuture, Runtime};
 use wacore::stanza::call::OfferDeviceKey;
@@ -16,6 +17,15 @@ use wacore_binary::{Jid, Node};
 use crate::client::CallError;
 
 const ANSWER_TRANSITION_LANES: usize = 16;
+
+/// How long a call with live media waits for signaling to come back after the connection drops.
+///
+/// A reconnect is a backoff, a connect through whatever proxy the host uses (bounded at 20 s) and a
+/// login, so one attempt that succeeds takes a few seconds and one that fails and is retried can
+/// take most of a minute. 30 s covers a single failed attempt; beyond it the connection is more
+/// likely gone for good than slow, and a call whose peer may have hung up unseen is better ended
+/// than left running.
+pub const SIGNALING_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Encryption results retain the full rung device set even when some devices cannot be encrypted.
 pub struct DirectCallKeys {
@@ -69,6 +79,9 @@ pub type CallAckFuture = BoxFuture<'static, Result<Node, CallError>>;
 /// Session state shared by call builders and inbound signaling on one host.
 pub struct DirectCallState {
     epoch: portable_atomic::AtomicU64,
+    /// Set by the host while the connection it is closing is expected to be replaced, and read by
+    /// the cleanup that follows, which then suspends calls with live media instead of ending them.
+    pub(crate) signaling_expected_back: portable_atomic::AtomicBool,
     pub(crate) call_registry: Arc<CallRegistry>,
     pub(crate) pending_outgoing_calls: Arc<Mutex<HashMap<String, super::facade::PendingOutgoing>>>,
     pub(crate) answer_transition_locks: OnceLock<[Arc<AsyncMutex<()>>; ANSWER_TRANSITION_LANES]>,
@@ -78,6 +91,7 @@ impl DirectCallState {
     pub fn new(registry: Arc<CallRegistry>) -> Self {
         Self {
             epoch: portable_atomic::AtomicU64::new(0),
+            signaling_expected_back: portable_atomic::AtomicBool::new(false),
             call_registry: registry,
             pending_outgoing_calls: Arc::new(Mutex::new(HashMap::new())),
             answer_transition_locks: OnceLock::new(),
@@ -156,6 +170,52 @@ pub fn disconnect(host: &dyn DirectCallHost) {
         .fetch_add(1, portable_atomic::Ordering::AcqRel);
     host.call_state().call_registry.abort_all();
     super::facade::drain_direct_pending(host);
+}
+
+/// The signaling connection dropped and the host expects to reconnect: end what cannot outlive it
+/// and let calls with live media keep running, for at most `resume_within`.
+///
+/// The epoch still advances, so anything begun before the loss (call setup, an answer in flight)
+/// is fenced out as it is by [`disconnect`]. Kept calls are told with
+/// [`CallEvent::SignalingSuspended`](wacore::voip_control::CallEvent::SignalingSuspended); the
+/// host reports the new connection with [`resume_signaling`], and a call still waiting when the
+/// deadline passes ends with
+/// [`CallEvent::SignalingResumeTimedOut`](wacore::voip_control::CallEvent::SignalingResumeTimedOut).
+/// A logout, a replaced stream or a ban is not this: the host calls [`disconnect`] for those.
+pub fn suspend_signaling(
+    host: &Arc<dyn DirectCallHost>,
+    resume_within: Duration,
+) -> wacore::voip_control::registry::SignalingSuspension {
+    host.call_state()
+        .epoch
+        .fetch_add(1, portable_atomic::Ordering::AcqRel);
+    let outcome = host.call_state().call_registry.suspend_signaling();
+    super::facade::drain_direct_pending(&**host);
+    if let Some(episode) = outcome.episode {
+        let runtime = host.runtime();
+        let host = Arc::downgrade(host);
+        let sleeper = runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                sleeper.sleep(resume_within).await;
+                if let Some(host) = host.upgrade() {
+                    host.call_state()
+                        .call_registry
+                        .end_suspended_signaling(episode);
+                }
+            }))
+            .detach();
+    }
+    outcome
+}
+
+/// The host has a signaling connection again: re-attach every suspended call to it. Returns how
+/// many calls had been waiting.
+///
+/// Nothing is rebuilt. A call's signaling is addressed by call id and sent through the host's
+/// current connection, so once the host can send and receive again the call is as it was.
+pub fn resume_signaling(host: &dyn DirectCallHost) -> usize {
+    host.call_state().call_registry.resume_signaling()
 }
 
 pub use super::direct_ingress::ingest_direct_call as ingest;

@@ -123,6 +123,20 @@ impl VideoNegotiation {
     }
 }
 
+/// What [`CallRegistry::suspend_signaling`] did to the calls it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalingSuspension {
+    /// Calls whose media is live and that are now waiting for signaling to return.
+    pub kept: usize,
+    /// Calls that could not outlive the loss and were ended.
+    pub ended: usize,
+    /// The loss episode this call set is waiting under, when this loss suspended a call that was
+    /// not already waiting. The caller arms one deadline for it and hands it to
+    /// [`CallRegistry::end_suspended_signaling`]; `None` means every kept call is already under
+    /// an earlier deadline, which a repeated loss must not extend.
+    pub episode: Option<u64>,
+}
+
 /// Runs its closure when dropped. Stored on a [`CallEntry`] to wake the call's `wait_ended()` waiter
 /// whenever the entry is removed (terminal stanza, disconnect, supersession) -- including in the
 /// window after registration but before a media task exists to carry the notify on its own teardown.
@@ -141,6 +155,9 @@ impl Drop for EndedNotify {
 struct CallEntry {
     session: CallSession,
     direct_media_connected: bool,
+    /// The signaling connection dropped while this call's media kept running: the loss episode that
+    /// suspended it. Set by [`CallRegistry::suspend_signaling`], cleared when signaling returns.
+    signaling_suspended: Option<u64>,
     /// The media plane, behind the neutral seam. It owns the driver command mailboxes (recv-rekey,
     /// video-control, group-control) and the epoch retained before media attaches; the registry
     /// reaches media only through [`VoipMediaSession`]. Present from registration, before the
@@ -524,6 +541,17 @@ impl Drop for CallEventPermit {
     }
 }
 
+impl CallEntry {
+    /// Whether this call's media is live and independent of signaling: a direct call that reached
+    /// accepted media readiness and has not ended.
+    fn survives_signaling_loss(&self) -> bool {
+        self.direct_media_connected
+            && !self.is_group_call
+            && !self.is_call_link
+            && !self.session.is_ended()
+    }
+}
+
 impl Drop for CallEntry {
     fn drop(&mut self) {
         self.group_update_event.notify(usize::MAX);
@@ -596,6 +624,9 @@ fn pending_initial_group_control_matches(
 pub struct CallRegistry {
     inner: Mutex<HashMap<String, CallEntry>>,
     next_gen: AtomicU64,
+    /// Counts signaling-loss episodes that suspended a call, so a deadline armed for one loss cannot
+    /// end a call suspended by a later one.
+    signaling_episodes: AtomicU64,
     /// The media backend every new call's session comes from. The registry never names a concrete
     /// implementation: it asks the injected backend to `reserve` one per registration, so a build
     /// that ships no engine (or a test that ships a fake) is substituted at construction.
@@ -621,6 +652,7 @@ impl Default for CallRegistry {
         Self {
             inner: Mutex::new(HashMap::new()),
             next_gen: AtomicU64::new(0),
+            signaling_episodes: AtomicU64::new(0),
             backend: std::sync::OnceLock::new(),
             pending_initial_group_controls: Mutex::new(VecDeque::new()),
             registration_event: Arc::new(event_listener::Event::new()),
@@ -1852,6 +1884,7 @@ impl CallRegistry {
         let announced = session.peer_video_orientation.clone();
         let mut entry = CallEntry {
             direct_media_connected: false,
+            signaling_suspended: None,
             // A fresh call starts upright; the app announces a rotation when it
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
@@ -3463,6 +3496,112 @@ impl CallRegistry {
         n
     }
 
+    /// The signaling connection dropped and is expected back: end every call that cannot outlive
+    /// it, and leave the ones whose media is live running.
+    ///
+    /// Media is a relay session with its own keys, so a direct call that has reached accepted media
+    /// readiness does not need the signaling socket to keep carrying audio. Everything else (a
+    /// ringing offer, a call still negotiating its relay, a group or call-link call, whose roster
+    /// and epochs only signaling can deliver) is ended exactly as [`abort_all`](Self::abort_all)
+    /// ends it. Each kept call gets [`CallEvent::SignalingSuspended`] on its stream.
+    pub fn suspend_signaling(&self) -> SignalingSuspension {
+        self.ringing_calls().clear();
+        self.pending_controls().clear();
+        let (drained, notify, episode, kept) = {
+            let mut map = self.active_calls();
+            let doomed: Vec<String> = map
+                .iter()
+                .filter(|(_, entry)| !entry.survives_signaling_loss())
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut drained = Vec::with_capacity(doomed.len());
+            for id in doomed {
+                if let Some(mut entry) = map.remove(&id) {
+                    entry.close_reason = crate::voip_control::MediaCloseReason::RelayDisconnected;
+                    drained.push(entry);
+                }
+            }
+            let fresh = map
+                .values()
+                .any(|entry| entry.signaling_suspended.is_none());
+            let episode = fresh.then(|| self.signaling_episodes.fetch_add(1, Ordering::AcqRel) + 1);
+            let mut notify = Vec::new();
+            for entry in map.values_mut() {
+                if entry.signaling_suspended.is_none() {
+                    entry.signaling_suspended = episode;
+                    notify.extend(entry.media.clone());
+                }
+            }
+            (drained, notify, episode, map.len())
+        };
+        let outcome = SignalingSuspension {
+            kept,
+            ended: drained.len(),
+            episode,
+        };
+        // Off-lock: the dropped entries close their media and the publishes touch the streams.
+        drop(drained);
+        for media in notify {
+            media.publish(CallEvent::SignalingSuspended);
+        }
+        outcome
+    }
+
+    /// Signaling is back: tell every suspended call so, once. Returns how many were suspended.
+    pub fn resume_signaling(&self) -> usize {
+        let notify: Vec<Arc<dyn VoipMediaSession>> = {
+            let mut map = self.active_calls();
+            map.values_mut()
+                .filter_map(|entry| {
+                    let was_suspended = entry.signaling_suspended.take().is_some();
+                    entry.media.clone().filter(|_| was_suspended)
+                })
+                .collect()
+        };
+        let resumed = notify.len();
+        for media in notify {
+            media.publish(CallEvent::SignalingResumed);
+        }
+        resumed
+    }
+
+    /// Signaling did not come back in time: end every call still suspended by `episode` or an
+    /// earlier one, publishing [`CallEvent::SignalingResumeTimedOut`] before its stream closes.
+    /// Returns how many ended. A call suspended by a later loss is left to that loss's deadline.
+    pub fn end_suspended_signaling(&self, episode: u64) -> usize {
+        let drained: Vec<CallEntry> = {
+            let mut map = self.active_calls();
+            let ids: Vec<String> = map
+                .iter()
+                .filter(|(_, entry)| entry.signaling_suspended.is_some_and(|e| e <= episode))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut drained = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(mut entry) = map.remove(&id) {
+                    entry.close_reason = crate::voip_control::MediaCloseReason::SignalingLost;
+                    drained.push(entry);
+                }
+            }
+            drained
+        };
+        for media in drained.iter().filter_map(|entry| entry.media.as_ref()) {
+            media.publish(CallEvent::SignalingResumeTimedOut);
+        }
+        // Dropped after the publish: closing the media closes the stream, and the event queued
+        // above stays drainable behind it.
+        let ended = drained.len();
+        drop(drained);
+        ended
+    }
+
+    /// Whether this call is waiting for signaling to return.
+    pub fn is_signaling_suspended(&self, call_id: &str) -> bool {
+        self.active_calls()
+            .get(call_id)
+            .is_some_and(|entry| entry.signaling_suspended.is_some())
+    }
+
     /// Record why a call generation's media is ending, so the entry's `Drop` hands the reason to
     /// [`VoipMediaSession::close`]. Generation-guarded and ignored for an unknown call.
     pub fn set_close_reason(
@@ -3710,6 +3849,146 @@ mod tests {
             media.record().closed,
             Some(MediaCloseReason::RelayDisconnected)
         );
+    }
+
+    /// A registry with one call whose media is live and one that is still setting up, each with
+    /// its fake media session and an event subscription.
+    fn live_and_dormant() -> (
+        CallRegistry,
+        Arc<crate::voip_control::fake_backend::FakeMediaBackend>,
+        [(
+            u64,
+            async_channel::Receiver<crate::voip_control::MediaEvent>,
+        ); 2],
+        [Arc<crate::voip_control::fake_backend::FakeMediaSession>; 2],
+    ) {
+        use crate::voip_control::MediaSessionKey;
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let mut calls = Vec::new();
+        let mut media = Vec::new();
+        for id in ["LIVE", "DORMANT"] {
+            let generation = registry.insert(session(id));
+            assert!(registry.transition_if_current(id, generation, CallPhase::Calling));
+            let session = backend
+                .session(&MediaSessionKey {
+                    call_id: id.to_string(),
+                    generation,
+                })
+                .expect("reserved");
+            calls.push((generation, session.subscribe()));
+            media.push(session);
+        }
+        assert!(registry.direct_media_connected_if_current("LIVE", calls[0].0));
+        let [a, b] = <[_; 2]>::try_from(calls).ok().expect("two calls");
+        let [m, n] = <[_; 2]>::try_from(media).ok().expect("two sessions");
+        (registry, backend, [a, b], [m, n])
+    }
+
+    #[test]
+    fn losing_signaling_keeps_a_call_with_live_media_and_ends_the_rest() {
+        use crate::voip_control::{CallEvent, MediaCloseReason};
+
+        let (registry, _backend, [(_, live_events), (_, dormant_events)], [live, dormant]) =
+            live_and_dormant();
+
+        let outcome = registry.suspend_signaling();
+
+        assert_eq!((outcome.kept, outcome.ended), (1, 1));
+        assert!(outcome.episode.is_some());
+        assert_eq!(live.record().closed, None, "live media is left running");
+        assert_eq!(
+            dormant.record().closed,
+            Some(MediaCloseReason::RelayDisconnected)
+        );
+        assert!(registry.is_signaling_suspended("LIVE"));
+        assert!(registry.generation_of("LIVE").is_some());
+        assert!(registry.generation_of("DORMANT").is_none());
+        assert_eq!(live_events.try_recv(), Ok(CallEvent::SignalingSuspended));
+        assert!(
+            !matches!(dormant_events.try_recv(), Ok(CallEvent::SignalingSuspended)),
+            "an ended call is not told it was suspended"
+        );
+    }
+
+    #[test]
+    fn resuming_signaling_tells_each_suspended_call_once() {
+        use crate::voip_control::CallEvent;
+
+        let (registry, _backend, [(_, live_events), _], _media) = live_and_dormant();
+        registry.suspend_signaling();
+        assert_eq!(live_events.try_recv(), Ok(CallEvent::SignalingSuspended));
+
+        assert_eq!(registry.resume_signaling(), 1);
+        assert_eq!(live_events.try_recv(), Ok(CallEvent::SignalingResumed));
+        assert!(!registry.is_signaling_suspended("LIVE"));
+
+        assert_eq!(registry.resume_signaling(), 0, "nothing left to resume");
+        assert!(live_events.try_recv().is_err());
+        assert_eq!(
+            registry.end_suspended_signaling(u64::MAX),
+            0,
+            "a resumed call is not ended by a late deadline"
+        );
+        assert!(registry.generation_of("LIVE").is_some());
+    }
+
+    #[test]
+    fn a_call_still_suspended_at_the_deadline_ends_with_its_own_reason() {
+        use crate::voip_control::{CallEvent, MediaCloseReason};
+
+        let (registry, _backend, [(_, live_events), _], [live, _]) = live_and_dormant();
+        let episode = registry.suspend_signaling().episode.expect("a fresh loss");
+        assert_eq!(live_events.try_recv(), Ok(CallEvent::SignalingSuspended));
+
+        assert_eq!(registry.end_suspended_signaling(episode), 1);
+
+        assert!(registry.generation_of("LIVE").is_none());
+        assert_eq!(live.record().closed, Some(MediaCloseReason::SignalingLost));
+        assert_eq!(
+            live_events.try_recv(),
+            Ok(CallEvent::SignalingResumeTimedOut),
+            "the reason is queued before the stream closes, so a consumer can drain it"
+        );
+    }
+
+    #[test]
+    fn a_call_that_connected_after_the_loss_is_not_suspended() {
+        let (registry, _backend, _calls, _media) = live_and_dormant();
+        let episode = registry.suspend_signaling().episode.expect("a fresh loss");
+        let late = registry.insert(session("LATE"));
+        assert!(registry.transition_if_current("LATE", late, CallPhase::Calling));
+        assert!(registry.direct_media_connected_if_current("LATE", late));
+
+        assert_eq!(
+            registry.end_suspended_signaling(episode),
+            1,
+            "only LIVE was suspended"
+        );
+        assert!(registry.generation_of("LATE").is_some());
+    }
+
+    #[test]
+    fn a_repeated_loss_does_not_extend_the_first_deadline_and_a_later_one_gets_its_own() {
+        let (registry, _backend, _calls, _media) = live_and_dormant();
+        let first = registry.suspend_signaling();
+        let first_episode = first.episode.expect("a fresh loss");
+
+        let again = registry.suspend_signaling();
+        assert_eq!((again.kept, again.episode), (1, None), "already waiting");
+
+        registry.resume_signaling();
+        let second_episode = registry.suspend_signaling().episode.expect("a new loss");
+        assert!(second_episode > first_episode);
+
+        assert_eq!(
+            registry.end_suspended_signaling(first_episode),
+            0,
+            "the first loss's deadline must not end a call a later loss suspended"
+        );
+        assert_eq!(registry.end_suspended_signaling(second_episode), 1);
     }
 
     #[test]
