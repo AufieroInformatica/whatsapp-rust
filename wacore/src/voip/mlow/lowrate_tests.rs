@@ -154,6 +154,108 @@ fn low_rate_120ms_decode_matches_the_shipped_wasm() {
     );
 }
 
+/// Packets with in-band FEC set (TOC bit 1 with VAD): the redundant copy of the previous frame sits
+/// in front of the main frame and must be stepped over, not read as the main frame.
+fn check_fec_against_reference(frames_json: &str, ref_raw: &[u8], min_snr_db: f64) {
+    let packets = frames(frames_json);
+    let with_fec = packets.iter().filter(|p| p[0] & 0x42 == 0x42).count();
+    assert!(
+        with_fec * 2 > packets.len(),
+        "the fixture must stay mostly FEC packets, has {with_fec} of {}",
+        packets.len()
+    );
+    check_against_reference(frames_json, ref_raw, 0.999, min_snr_db);
+}
+
+#[test]
+fn low_rate_fec_60ms_decode_matches_the_c_reference() {
+    check_fec_against_reference(
+        include_str!("testdata/lr_c_fec60_frames.json"),
+        include_bytes!("testdata/lr_c_fec60_ref.raw"),
+        30.0,
+    );
+}
+
+#[test]
+fn low_rate_fec_20ms_decode_matches_the_c_reference() {
+    check_fec_against_reference(
+        include_str!("testdata/lr_c_fec20_frames.json"),
+        include_bytes!("testdata/lr_c_fec20_ref.raw"),
+        30.0,
+    );
+}
+
+#[test]
+fn low_rate_fec_120ms_decode_matches_the_c_reference() {
+    check_fec_against_reference(
+        include_str!("testdata/lr_c_fec120_frames.json"),
+        include_bytes!("testdata/lr_c_fec120_ref.raw"),
+        30.0,
+    );
+}
+
+#[test]
+fn low_rate_fec_60ms_decode_matches_the_shipped_wasm() {
+    check_fec_against_reference(
+        include_str!("testdata/lr_wasm_fec60_frames.json"),
+        include_bytes!("testdata/lr_wasm_fec60_ref.raw"),
+        28.0,
+    );
+}
+
+#[test]
+fn low_rate_fec_120ms_decode_matches_the_shipped_wasm() {
+    check_fec_against_reference(
+        include_str!("testdata/lr_wasm_fec120_frames.json"),
+        include_bytes!("testdata/lr_wasm_fec120_ref.raw"),
+        28.0,
+    );
+}
+
+/// Both directions of a rate switch in one stream: full rate, then low rate, then full rate again.
+/// The last segment must decode without loss and stay close to what a decoder that never left full
+/// rate produces. The earlier test covers full to low; this one covers both directions.
+#[test]
+fn full_to_low_to_full_rate_switch_decodes_all_three_segments() {
+    let hr = frames(include_str!("testdata/wasm_derived_frames.json"));
+    let lr = frames(include_str!("testdata/lr_c_lr60_frames.json"));
+
+    let mut dec = MlowDecoder::new();
+    let run = |dec: &mut MlowDecoder, packets: &[Vec<u8>]| {
+        let mut out = Vec::new();
+        for p in packets {
+            out.extend_from_slice(&dec.decode(p));
+            let r = dec.take_frame_report();
+            assert_eq!(
+                r.off_point + r.concealed,
+                0,
+                "no packet lost across a switch"
+            );
+        }
+        assert!(out.iter().any(|&s| s != 0.0));
+        out
+    };
+    let _first = run(&mut dec, &hr[..40]);
+    let _middle = run(&mut dec, &lr[..60]);
+    let last = run(&mut dec, &hr[40..90]);
+
+    let mut steady = MlowDecoder::new();
+    let all = run(&mut steady, &hr[..90]);
+    let tail = 20 * 960;
+    let (a, b) = (&all[all.len() - tail..], &last[last.len() - tail..]);
+    // Not 0.99: the noise generator's PRNG has advanced differently, so the noise component of
+    // the two decodes never lines up again. The voiced structure does.
+    let c = corr(a, b);
+    let rms =
+        |x: &[f32]| (x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
+    assert!(c > 0.9, "tail correlation after switching back {c:.5}");
+    let ratio = rms(b) / rms(a);
+    assert!(
+        (0.8..1.25).contains(&ratio),
+        "level after switching back {ratio:.3}x"
+    );
+}
+
 /// A low-rate packet whose body cannot hold its frames is concealed as lost, reported as concealed
 /// rather than refused, and leaves nothing behind: the next real packet decodes exactly as it does
 /// on a decoder that never saw the bad one.
@@ -239,11 +341,12 @@ fn a_call_that_switches_to_low_rate_keeps_decoding() {
     assert!(c > 0.99, "tail correlation after a rate switch {c:.5}");
 }
 
-/// Adversarial input at the low rate: truncations, byte flips and random bodies under low-rate TOCs
+/// Adversarial input at the low rate, FEC packets included: truncations, byte flips and random bodies under low-rate TOCs
 /// must neither panic nor produce more audio than a TOC can declare.
 #[test]
 fn low_rate_decode_survives_corrupt_input() {
-    let packets = frames(include_str!("testdata/lr_c_lr60_frames.json"));
+    let mut packets = frames(include_str!("testdata/lr_c_lr60_frames.json"));
+    packets.extend(frames(include_str!("testdata/lr_c_fec60_frames.json")));
     let mut dec = MlowDecoder::new();
     let mut decoded = 0u32;
     let mut check = |dec: &mut MlowDecoder, bytes: &[u8]| {
@@ -264,7 +367,7 @@ fn low_rate_decode_survives_corrupt_input() {
     }
     let mut seed = 0x1234_5678u32;
     for n in 0..4000 {
-        let mut body = vec![0x54 | (n as u8 & 0xA0)];
+        let mut body = vec![0x54 | (n as u8 & 0xA2)];
         for _ in 0..(n % 90) + 1 {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             body.push((seed >> 24) as u8);

@@ -7,7 +7,7 @@ the self-check hashes that describe the original full-rate outputs. `fixture` pa
 derivation wrote into the `lr_wasm_*` testdata files.
 
     python3 wasm_lowrate.py spec tools/oracle-core/specs/mlow_dtx_off.json OUT.json 8000 \
-        tools/oracle-core/specs/mlow_dtx_off.json
+        tools/oracle-core/specs/mlow_dtx_off.json [LOSS_PERCENT]
     oracle derive --spec OUT.json -o DIR          # `oracle` from tools/oracle-cli, release build
     python3 wasm_lowrate.py fixture DIR packet decoded raw FRAMES.json REF.raw
 
@@ -18,7 +18,7 @@ under about 8.7 kbps.
 import json, os, struct, sys
 
 
-def spec(src, dst, bitrate, donor):
+def spec(src, dst, bitrate, donor, loss_percent=0):
     d = json.load(open(src))
     if "encoder_ctl" not in d["functions"]:
         d["functions"]["encoder_ctl"] = json.load(open(donor))["functions"]["encoder_ctl"]
@@ -33,6 +33,16 @@ def spec(src, dst, bitrate, donor):
          "results": ["brrc"]},
         {"op": "assert_reg", "reg": "$brrc", "equals": 0},
     ]
+    if loss_percent:
+        # In-band FEC (4012) plus the expected loss (4014). The bitrate is then main plus
+        # redundancy, so pass about twice the reduced-rate threshold for the main part to fit.
+        for request, value in ((4012, 1), (4014, loss_percent)):
+            steps[i + 6:i + 6] = [
+                {"op": "write", "ptr": "$ctl_arg_lr", "hex": struct.pack("<i", value).hex()},
+                {"op": "call_table", "func": "encoder_ctl", "args": ["$enc_lr", request, "$ctl_arg_lr"],
+                 "results": ["ctlrc_lr"]},
+            ]
+            i += 2
     json.dump(d, open(dst, "w"), indent=1)
 
 
@@ -54,7 +64,7 @@ def fixture(directory, pkt_prefix, dec_prefix, dec_ext, frames_out, pcm_out):
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "spec":
-        spec(args[0], args[1], int(args[2]), args[3])
+        spec(args[0], args[1], int(args[2]), args[3], int(args[4]) if len(args) > 4 else 0)
     elif cmd == "fixture":
         fixture(*args)
     else:

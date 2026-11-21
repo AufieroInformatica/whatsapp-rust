@@ -165,6 +165,8 @@ Real calls reach it as soon as a call is switched from audio to video; the packe
 | `lr_c_lr60_yhp.f32` | the C decoder's per-frame synthesis output (after tilt and HP filters) | `smpl_lowrate` synthesis test |
 | `lr_wasm_lr60_frames.json`, `lr_wasm_lr60_ref.raw` | the shipped module's encoder at `SET_BITRATE` 8000, 60 ms, and its decoder's PCM | `lowrate_tests` |
 | `lr_wasm_lr60_6k_*`, `lr_wasm_lr120_*` | the same at 6000 bps, and at 8500 bps with 120 ms packets | `lowrate_tests` |
+| `lr_c_fec{20,60,120}_*` | the C reference with in-band FEC on and 20 % expected loss, total bitrate 14-16 kbps (main part under the reduced-rate threshold): TOCs `0x56`/`0x4e`/`0x5e` next to the others | `lowrate_tests` |
+| `lr_wasm_fec{60,120}_*` | the shipped module's encoder with `OPUS_SET_INBAND_FEC` and `OPUS_SET_PACKET_LOSS_PERC` (4012, 4014) the same way | `lowrate_tests` |
 
 Two independent decoders therefore agree with this one on reduced-rate packets: the C reference
 (`84b076e0`) and the shipped module (`JgwtTQVeWPm`). Against both, the full-stream correlation is
@@ -175,8 +177,12 @@ port's float math against the references', not a reduced-rate effect.
 What these do not establish:
 
 - No packet captured from a phone is in the corpus. The encoders ran on synthetic input at
-  6 to 10 kbps; a phone in a video call may use settings the corpus never reaches (FEC packets, a
-  bitrate change inside a call, different DTX behaviour).
+  6 to 10 kbps (14-16 kbps total with FEC); a phone in a video call may use settings the corpus
+  never reaches (a bitrate change inside a call, different DTX behaviour).
+- FEC is stepped over, not used: a packet with VAD and TOC bit 1 set has the previous frames'
+  redundant copy in front of its own, and the low-rate path reads and discards it to reach the main
+  frames. Both references decode the main frames the same way. The full-rate path does not step
+  over it, which was left as it was and not tested.
 - Coded-inactive packets (`0x14`) and comfort-noise packets decode, but their audio is not
   compared tightly: the references add comfort noise there and this decoder does not, same as at the
   full rate. They are quiet.

@@ -19,11 +19,16 @@ INPUT = os.path.join(DATA, "synth_mic.raw")
 # (tag, packet ms, packets, bitrate). The reference chooses the reduced rate when the bitrate is at
 # or under 8700 bps (60/120 ms) or 10200 bps (20 ms); these sit just below.
 RUNS = [("lr60", 60, 110, 8000), ("lr20", 20, 150, 10000), ("lr120", 120, 8, 8500)]
+# With in-band FEC the bitrate is main plus redundancy, so the main part sits under the threshold at
+# a total of about twice it. These give TOCs 0x56 (reduced rate, FEC set) next to 0x14/0x16/0x54.
+FEC_RUNS = [("fec60", 60, 110, 14000), ("fec20", 20, 150, 16000), ("fec120", 120, 8, 14000)]
 
 
 def run(ms, count, bitrate, tag):
     dump = os.path.join(SCRATCH, f"{tag}.dump")
     env = dict(os.environ, SMPL_DUMP=dump)
+    if tag.startswith("fec"):
+        env.update(FEC="1", LOSS="20")
     out = subprocess.run([BIN, INPUT, str(ms), str(count), str(bitrate)], env=env,
                          capture_output=True, text=True, check=True).stdout
     frames, pcm = [], bytearray()
@@ -50,7 +55,7 @@ def write_json(name, obj):
         f.write("\n")
 
 
-for tag, ms, count, bitrate in RUNS:
+for tag, ms, count, bitrate in RUNS + FEC_RUNS:
     frames, pcm, recs, yhp = run(ms, count, bitrate, tag)
     write_json(f"lr_c_{tag}_frames.json", frames)
     with open(os.path.join(DATA, f"lr_c_{tag}_ref.raw"), "wb") as f:

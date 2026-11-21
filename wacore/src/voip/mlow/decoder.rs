@@ -383,6 +383,16 @@ impl MlowDecoder {
         // for the per-packet harmonic postfilter.
         let mut packet_lags: Vec<f32> = Vec::with_capacity(frames * 8);
         let mut avg_norm_br = 0.0f32;
+        // A packet with in-band FEC (VAD and TOC bit 1) carries a redundant copy of the previous
+        // packet's frames in front of its own, coded the same way and always as active voice. The
+        // redundancy is not used, but it has to be read to get to the main frames. Only the low
+        // rate does this; the full-rate path has never stepped over it.
+        if low_rate && frame[0] & 0x42 == 0x42 {
+            let mut skipped = self.state.lstate.clone();
+            for f in 0..frames {
+                let _ = decode_low_rate_frame(&mut dec, tbl, mem, cc, &mut skipped, f, true);
+            }
+        }
         for f in 0..frames {
             if low_rate {
                 let fr = decode_low_rate_frame(
