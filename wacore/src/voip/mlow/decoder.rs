@@ -11,6 +11,7 @@ use super::smpl_cc_tables::load_cc_tables;
 use super::smpl_celpdec::CelpDecParams;
 use super::smpl_decode::{decode_smpl_lsf, load_smpl_tables};
 use super::smpl_gains::decode_smpl_gains;
+use super::smpl_lowrate::decode_low_rate_frame;
 use super::smpl_mem::load_smpl_mem;
 use super::smpl_pitch::decode_smpl_pitch;
 use super::smpl_pulse::decode_smpl_pulses;
@@ -99,8 +100,8 @@ pub struct MlowDecoder {
     /// silently), so it does not detect a tampered payload. Read via `had_error`. Diagnostic only,
     /// never gates output.
     had_error: bool,
-    /// Count of inbound frames dropped because they fall outside this decoder's single operating point
-    /// (16kHz wideband, low_rate=0, and a duration whose internal geometry it implements). Such a
+    /// Count of inbound frames dropped because they fall outside this decoder's operating point
+    /// (16kHz wideband, and a duration whose internal geometry it implements). Such a
     /// frame would desync the range coder if decoded, so it is dropped (treated as a lost frame). The
     /// count drives a once + every-100th `warn` naming the offending dimension.
     dropped_unsupported: u32,
@@ -312,16 +313,14 @@ impl MlowDecoder {
             self.report.inactive_or_sid = self.report.inactive_or_sid.saturating_add(1);
             return vec![0.0; samps];
         }
-        // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
-        // geometry, or a duration whose internal geometry differs would consume the payload with the
-        // wrong symbol count and desync the range coder (garbage plus a poisoned cross-frame predictor
-        // that propagates to later packets). Drop those as lost frames so the predictor holds its last
-        // good values. flag2 is the smpl TOC's low_rate bit.
+        // Operating-point guard for active frames: a different internal rate or a duration whose
+        // internal geometry differs would consume the payload with the wrong symbol count and desync
+        // the range coder (garbage plus a poisoned cross-frame predictor that propagates to later
+        // packets). Drop those as lost frames so the predictor holds its last good values. The
+        // low_rate bit is not one of them: that geometry (2x160) is decoded.
         let frames = internal_frames(toc.frame_ms);
         let off_point = if toc.sample_rate != 16000 {
             Some(("rate", i64::from(toc.sample_rate / 1000)))
-        } else if toc.low_rate {
-            Some(("low_rate", 1))
         } else if frames.is_none() {
             Some(("frame_ms", i64::from(toc.frame_ms)))
         } else {
@@ -332,7 +331,7 @@ impl MlowDecoder {
             if self.dropped_unsupported == 1 || self.dropped_unsupported.is_multiple_of(100) {
                 log::warn!(
                     "mlow: dropping out-of-operating-point frame #{} ({dim}={val}, TOC 0x{:02x}); \
-                     the decoder runs 16kHz / low_rate=0 / 20-120ms",
+                     the decoder runs 16kHz / 20-120ms",
                     self.dropped_unsupported,
                     frame[0]
                 );
@@ -385,6 +384,41 @@ impl MlowDecoder {
         let mut packet_lags: Vec<f32> = Vec::with_capacity(frames * 8);
         let mut avg_norm_br = 0.0f32;
         for f in 0..frames {
+            if low_rate {
+                let fr = decode_low_rate_frame(
+                    &mut dec,
+                    tbl,
+                    mem,
+                    cc,
+                    &mut self.state.lstate,
+                    f,
+                    coded_as_active_voice,
+                );
+                packet_lags.extend_from_slice(&fr.params.block_lags);
+                avg_norm_br += super::smpl_gennoise::smpl_get_normalized_bitrate(
+                    fr.params.total_pulses,
+                    SMPL_INTF_LEN as i32,
+                );
+                let nlsf = smpl_reconstruct_nlsf(
+                    synth_t,
+                    fr.lsf.stage1 as usize,
+                    config,
+                    fr.lsf.grid as usize,
+                    &fr.lsf.stage2,
+                    &self.state.prev_nlsf,
+                );
+                let mut sig = [0f32; SMPL_INTF_LEN];
+                self.state.celp.synth_frame_lr(
+                    &nlsf,
+                    fr.lsf.extra as usize,
+                    &fr.pulses.pulses,
+                    &fr.params,
+                    &mut sig,
+                );
+                self.state.prev_nlsf = nlsf;
+                out.extend_from_slice(&sig);
+                continue;
+            }
             let lsf = decode_smpl_lsf(
                 &mut dec,
                 tbl,
@@ -1254,8 +1288,8 @@ mod tests {
         fuzz_decode_shard(3);
     }
 
-    // Fail-loud guards: a frame outside our single operating point (32kHz/fullband, or low_rate=1) is
-    // DROPPED to 60ms silence WITHOUT touching the range coder, so it can't desync + poison the
+    // Fail-loud guards: a frame outside our operating point (32kHz/fullband, or a 10 ms active frame)
+    // is DROPPED to silence WITHOUT touching the range coder, so it can't desync + poison the
     // cross-frame predictor. A real low_rate=0 frame before and after the drops still decodes (proves
     // the drop is a clean "lost frame", not a desync), and the guards don't false-positive on it.
     #[test]
@@ -1280,15 +1314,6 @@ mod tests {
         assert!(
             out_32k.iter().all(|&s| s == 0.0),
             "32kHz frame must drop to silence"
-        );
-
-        // A low_rate=1 TOC -> dropped to 60ms silence. 0x54 = 0b0101_0100: bit5=0 (16kHz, so the rate
-        // branch does NOT catch it), bits4:3=10 (60ms), bit2=1 (low_rate) -> exercises the low_rate branch.
-        let out_lr = dec.decode(&[0x54, 0xAA, 0xBB, 0xCC]);
-        assert_eq!(out_lr.len(), 960);
-        assert!(
-            out_lr.iter().all(|&s| s == 0.0),
-            "low_rate=1 frame must drop to silence"
         );
 
         // A 10ms ACTIVE 16kHz/low_rate=0 TOC (0x40) must also drop: it is the one duration whose

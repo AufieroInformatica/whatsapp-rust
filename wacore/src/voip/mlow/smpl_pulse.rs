@@ -24,7 +24,8 @@ pub(crate) struct SmplPulseResult {
 }
 
 /// Decode the pulse blocks of one internal frame. `p2` = frame samples (320), `p3` = num subframes
-/// (4), `p4` = regular flag (1), `p6` = config (0/1), `s1` = LSF stage-1 selector.
+/// (4, or 2 with `p6` = 1), `p4` = regular flag (1), `p6` = config (0/1), `s1` = LSF stage-1
+/// selector.
 pub(crate) fn decode_smpl_pulses(
     dec: &mut RangeDecoder,
     cc: &CcTables,
@@ -82,9 +83,17 @@ pub(crate) fn decode_smpl_pulses(
         k as i32
     };
 
-    // --- recursive binary SPLIT (p3==4 path) ---
+    // --- binary SPLIT ---
     let mut split = [0i32; 8];
-    if total != 0 {
+    if total != 0 && p3 == 2 {
+        // Two subframes: a single split of the frame total, bounded by what one subframe can hold.
+        // A corrupt -1 zeroes the split, the same as the four-subframe path below.
+        let first = smpl_split_3537(dec, cc, total, subfr_len16);
+        if first != -1 {
+            split[0] = first;
+            split[1] = total - first;
+        }
+    } else if total != 0 {
         let mut sum = (total - subfr_len16 * 2).max(0);
         let lo = (total - 80).max(0);
         if sum < lo {

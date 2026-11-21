@@ -148,7 +148,13 @@ fn smpl_get_env0(len: usize, smth_coef: f32, smth_state: &mut f32, env: &mut [f3
 // Filters.
 
 /// `smpl_filt_ma1` (coef_len=2, state_len=1). `x != y`.
-fn smpl_filt_ma1(x: &[f32], n: usize, coef: &[f32; 2], state: &mut [f32; 1], y: &mut [f32]) {
+pub(super) fn smpl_filt_ma1(
+    x: &[f32],
+    n: usize,
+    coef: &[f32; 2],
+    state: &mut [f32; 1],
+    y: &mut [f32],
+) {
     if coef[0] == 1.0 {
         for k in 1..n {
             y[k] = x[k] + coef[1] * x[k - 1];
@@ -177,7 +183,7 @@ fn smpl_filt_ar1(x: &[f32], n: usize, coef: &[f32; 2], state: &mut [f32; 1], y: 
 }
 
 /// `smpl_filt_arma1`: MA1 then AR1, state {ma, ar}. Supports in-place (x==y) via a temp buffer.
-fn smpl_filt_arma1(
+pub(super) fn smpl_filt_arma1(
     x: &[f32],
     n: usize,
     coef_ma: &[f32; 2],
