@@ -9,7 +9,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::smpl_gennoise::{
-    NoiseGenerator, smpl_celp_gen_noise, smpl_decode_resnrg, smpl_get_normalized_bitrate,
+    NoiseGenerator, smpl_celp_gen_noise, smpl_decode_resnrg, smpl_filt_arma1, smpl_filt_ma1,
+    smpl_get_normalized_bitrate,
 };
 use std::sync::OnceLock;
 
@@ -35,6 +36,23 @@ const SMPL_DEC_ACB_HIGH_BOOST: [f32; 2] = [0.35, 0.18];
 
 /// LSF->LPC interpolation factors per subframe, `[lsf_interpol_idx][sf]`.
 const SMPL_LSF_INTERPOL_4: [[f32; 4]; 2] = [[0.55, 0.88, 1.0, 1.0], [0.3, 0.65, 0.95, 1.0]];
+
+/// The same, for the reduced-rate geometry of two 160-sample subframes.
+const SMPL_LSF_INTERPOL_2: [[f32; 2]; 2] = [[0.75, 1.0], [0.4, 0.95]];
+
+/// Reduced-rate subframe geometry: 160 samples, so four 40-sample lag blocks each.
+const SMPL_LR_SUBFR_LEN: usize = 160;
+const SMPL_LR_NUM_SUBFR: usize = 2;
+const SMPL_LR_LAGS_PER_SUBFR: usize = SMPL_LR_SUBFR_LEN / SMPL_LAG_SUBFRLEN;
+/// ACB state window for 160-sample subframes; the full-rate window is a prefix of the same buffer.
+const SMPL_LR_ACB_STATE_LEN: usize =
+    SMPL_LR_SUBFR_LEN + 2 * SMPL_MAX_PITCH_LAG + SMPL_LTP_INTERPOL_DELAY;
+
+/// Unvoiced pulse shaping applied to the FCB excitation at the reduced rate: MA then AR, first order.
+const SMPL_LR_UV_SHAPE_MA: [f32; 2] = [0.5, 0.1665];
+const SMPL_LR_UV_SHAPE_AR: [f32; 2] = [1.0, -0.333];
+/// Output tilt postfilter at the reduced rate, `[voiced]`. The unvoiced row is the identity.
+const SMPL_LR_POST_TILT: [[f32; 2]; 2] = [[1.0, 0.0], [0.84, 0.16]];
 
 /// 16-tap symmetric LTP interpolation kernel.
 #[rustfmt::skip]
@@ -119,19 +137,19 @@ fn nlsf_poly(out: &mut [f64], cosv: &[f64], half: usize, parity: usize) {
 /// Per-subframe interpolation of the LSF between `prev_lsf` and `lsf`, then NLSF->A. Returns the
 /// per-subframe A coefficients and writes the per-subframe interpolated LSF. Mutates `prev_lsf` to
 /// the last interpolated LSF (codec carries it across frames).
-fn lpc_interpol(
+fn lpc_interpol<const N: usize>(
     lsf: &[f32],
     prev_lsf: &mut [f32; SMPL_LPC_ORDER],
-    interpol: &[f32; 4],
-    a_out: &mut [[f32; SMPL_LPC_ORDER + 1]; SMPL_NUM_SUBFR],
-    lsfs_out: &mut [[f32; SMPL_LPC_ORDER]; SMPL_NUM_SUBFR],
+    interpol: &[f32; N],
+    a_out: &mut [[f32; SMPL_LPC_ORDER + 1]; N],
+    lsfs_out: &mut [[f32; SMPL_LPC_ORDER]; N],
 ) {
     if prev_lsf[SMPL_LPC_ORDER - 1] == 0.0 {
         prev_lsf[..SMPL_LPC_ORDER].copy_from_slice(&lsf[..SMPL_LPC_ORDER]);
     }
     let mut ilsf = [0.0f32; SMPL_LPC_ORDER];
     let mut prev_factor = -1.0f32;
-    for j in 0..SMPL_NUM_SUBFR {
+    for j in 0..N {
         if interpol[j] == prev_factor {
             a_out[j] = a_out[j - 1];
         } else {
@@ -337,6 +355,10 @@ pub(crate) struct CelpDecState {
     lpc_synth_mem: [f32; SMPL_LPC_ORDER],
     lsf_prev: [f32; SMPL_LPC_ORDER],
     prev_nrgres: f32,
+    /// Reduced-rate unvoiced pulse-shaping filter memory (MA, AR).
+    uv_shape_state: [f32; 2],
+    /// Reduced-rate tilt postfilter memory: the previous excitation sample.
+    tilt_state: f32,
     /// Post-LPC HP (pitch-harmonic) postfilter state, persistent across the stream.
     hp: super::smpl_harmcomb::HpPostfilterState,
     /// Test-only capture of the per-subframe pre-noise excitation (`exc_pre`), 80/subframe.
@@ -357,6 +379,8 @@ impl Clone for CelpDecState {
             lpc_synth_mem: self.lpc_synth_mem,
             lsf_prev: self.lsf_prev,
             prev_nrgres: self.prev_nrgres,
+            uv_shape_state: self.uv_shape_state,
+            tilt_state: self.tilt_state,
             hp: self.hp.clone(),
             #[cfg(test)]
             dbg_exc_pre: Vec::new(),
@@ -377,6 +401,8 @@ impl Clone for CelpDecState {
         self.lpc_synth_mem = source.lpc_synth_mem;
         self.lsf_prev = source.lsf_prev;
         self.prev_nrgres = source.prev_nrgres;
+        self.uv_shape_state = source.uv_shape_state;
+        self.tilt_state = source.tilt_state;
         self.hp.copy_state_from(&source.hp);
         // `dbg_exc_pre` is deliberately not carried, for the reason above the `clone` impl.
     }
@@ -387,11 +413,13 @@ impl Default for CelpDecState {
         let acb_state_len = SMPL_SUBFR_LEN + 2 * SMPL_MAX_PITCH_LAG + SMPL_LTP_INTERPOL_DELAY;
         CelpDecState {
             noise: NoiseGenerator::default(),
-            acb_state: vec![0.0; acb_state_len],
+            acb_state: vec![0.0; SMPL_LR_ACB_STATE_LEN],
             acb_state_len,
             lpc_synth_mem: [0.0; SMPL_LPC_ORDER],
             lsf_prev: [0.0; SMPL_LPC_ORDER],
             prev_nrgres: 0.0,
+            uv_shape_state: [0.0; 2],
+            tilt_state: 0.0,
             hp: super::smpl_harmcomb::HpPostfilterState::default(),
             #[cfg(test)]
             dbg_exc_pre: Vec::new(),
@@ -481,6 +509,9 @@ impl CelpDecState {
             for i in 0..SMPL_SUBFR_LEN {
                 lpc_res[base + i] += noise[i];
             }
+            // The tilt filter is off at the full rate but its memory still follows the excitation,
+            // so a switch to the reduced rate starts from the right sample.
+            self.tilt_state = lpc_res[base + SMPL_SUBFR_LEN - 1];
 
             // LPC synthesis (contiguous history across subframes/frames).
             filt_ar16(
@@ -495,9 +526,13 @@ impl CelpDecState {
         self.lpc_synth_mem
             .copy_from_slice(&ybuf[SMPL_LPC_ORDER + SMPL_FRAME_LEN - SMPL_LPC_ORDER..]);
 
-        // Post-LPC HP (pitch-harmonic) postfilter (LPC postfilter is off on this stream, tilt
-        // postfilter is low_rate-only). The comb lag is the energy-weighted mean of the 8 per-40-block
-        // lags (0 -> the default fixed-corner curve, unvoiced).
+        self.hp_postfilter(params, out);
+    }
+
+    /// Post-LPC HP (pitch-harmonic) postfilter (LPC postfilter is off on this stream, tilt
+    /// postfilter is low_rate-only). The comb lag is the energy-weighted mean of the 8 per-40-block
+    /// lags (0 -> the default fixed-corner curve, unvoiced).
+    fn hp_postfilter(&mut self, params: &CelpDecParams, out: &mut [f32]) {
         let lag = if params.voiced {
             let (mut sl, mut sll) = (0f32, 0f32);
             for &l in &params.block_lags {
@@ -517,6 +552,126 @@ impl CelpDecState {
             &mut hp_out,
         );
         out[..SMPL_FRAME_LEN].copy_from_slice(&hp_out);
+    }
+
+    /// Synthesize one reduced-rate 20 ms internal frame: two 160-sample subframes, each with four
+    /// 40-sample lag blocks. Same chain as [`Self::synth_frame`] (pulses, ACB, shaped noise, LPC
+    /// synthesis, HP postfilter) plus the reduced-rate extras: pitch sharpening on the voiced FCB,
+    /// pulse shaping on unvoiced FCB, and the output tilt filter.
+    pub(crate) fn synth_frame_lr(
+        &mut self,
+        nlsf: &[f32],
+        lsf_interpol_idx: usize,
+        pulses: &[i32],
+        params: &CelpDecParams,
+        out: &mut [f32],
+    ) {
+        const SF: usize = SMPL_LR_SUBFR_LEN;
+        let gains = fcb_gains();
+        let mut a = [[0.0f32; SMPL_LPC_ORDER + 1]; SMPL_LR_NUM_SUBFR];
+        let mut lsfs = [[0.0f32; SMPL_LPC_ORDER]; SMPL_LR_NUM_SUBFR];
+        let interpol = &SMPL_LSF_INTERPOL_2[lsf_interpol_idx.min(1)];
+        lpc_interpol(nlsf, &mut self.lsf_prev, interpol, &mut a, &mut lsfs);
+
+        let normalized_bitrate =
+            smpl_get_normalized_bitrate(params.total_pulses, SMPL_FRAME_LEN as i32);
+
+        let mut lpc_res = [0.0f32; SMPL_FRAME_LEN];
+        let gain_tab: &[f32] = if params.voiced { &gains.v } else { &gains.uv };
+        for pos in 0..SMPL_FRAME_LEN {
+            if pulses[pos] != 0 {
+                let sf = pos / SF;
+                lpc_res[pos] = pulses[pos] as f32 * gain_tab[params.fcbg_idx[sf] as usize];
+            }
+        }
+
+        let mut ybuf = [0.0f32; SMPL_LPC_ORDER + SMPL_FRAME_LEN];
+        ybuf[..SMPL_LPC_ORDER].copy_from_slice(&self.lpc_synth_mem);
+        let tilt = &SMPL_LR_POST_TILT[usize::from(params.voiced)];
+        for sf in 0..SMPL_LR_NUM_SUBFR {
+            let base = sf * SF;
+            let mut sf_lags = [0.0f32; SMPL_LR_LAGS_PER_SUBFR];
+            sf_lags.copy_from_slice(
+                &params.block_lags[sf * SMPL_LR_LAGS_PER_SUBFR..(sf + 1) * SMPL_LR_LAGS_PER_SUBFR],
+            );
+            celp_decode(
+                &mut self.acb_state,
+                SMPL_LR_ACB_STATE_LEN,
+                params.voiced,
+                params.acbg_idx[sf],
+                &sf_lags,
+                SMPL_LR_LAGS_PER_SUBFR,
+                SF,
+                true,
+                normalized_bitrate,
+                &mut lpc_res[base..base + SF],
+            );
+
+            let nrgres = smpl_decode_resnrg(params.nrgres_dbq_q14[sf], SF as i32);
+            if !params.voiced {
+                self.prev_nrgres = nrgres;
+            }
+            let mut noise = [0.0f32; SF];
+            smpl_celp_gen_noise(
+                &mut self.noise,
+                &lpc_res[base..base + SF],
+                SF,
+                params.voiced,
+                params.sf_pulses[sf],
+                nrgres,
+                params.fcbg_idx[sf],
+                &lsfs[sf],
+                normalized_bitrate,
+                &gains.uv,
+                &mut noise,
+            );
+
+            if !params.voiced && params.sf_pulses[sf] > 0 {
+                let mut x = [0.0f32; SF];
+                x.copy_from_slice(&lpc_res[base..base + SF]);
+                smpl_filt_arma1(
+                    &x,
+                    SF,
+                    &SMPL_LR_UV_SHAPE_MA,
+                    &SMPL_LR_UV_SHAPE_AR,
+                    &mut self.uv_shape_state,
+                    &mut lpc_res[base..base + SF],
+                );
+            } else {
+                self.uv_shape_state = [0.0; 2];
+            }
+            for i in 0..SF {
+                lpc_res[base + i] += noise[i];
+            }
+
+            if tilt[0] < 1.0 {
+                let mut filtered = [0.0f32; SF];
+                let mut state = [self.tilt_state];
+                smpl_filt_ma1(
+                    &lpc_res[base..base + SF],
+                    SF,
+                    tilt,
+                    &mut state,
+                    &mut filtered,
+                );
+                self.tilt_state = state[0];
+                lpc_res[base..base + SF].copy_from_slice(&filtered);
+            } else {
+                self.tilt_state = lpc_res[base + SF - 1];
+            }
+
+            filt_ar16(
+                &lpc_res[base..base + SF],
+                &a[sf],
+                &mut ybuf,
+                SMPL_LPC_ORDER + base,
+                SF,
+            );
+        }
+        out[..SMPL_FRAME_LEN].copy_from_slice(&ybuf[SMPL_LPC_ORDER..]);
+        self.lpc_synth_mem
+            .copy_from_slice(&ybuf[SMPL_LPC_ORDER + SMPL_FRAME_LEN - SMPL_LPC_ORDER..]);
+        self.hp_postfilter(params, out);
     }
 }
 

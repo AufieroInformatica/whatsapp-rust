@@ -13,6 +13,7 @@ mod encode;
 #[cfg(test)]
 mod fixture;
 mod golden;
+mod lowrate_tests;
 mod multiframe;
 mod param_decode_match;
 mod params;
@@ -28,6 +29,7 @@ mod smpl_gains;
 mod smpl_gennoise;
 mod smpl_harm_postfilter;
 mod smpl_harmcomb;
+mod smpl_lowrate;
 mod smpl_lpc;
 mod smpl_lsf_quant;
 mod smpl_lsf_seed;

@@ -110,6 +110,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             opus_encoder_ctl(encoder.pointer.as_ptr(), 4022, 1_i32),
             "channels",
         )?;
+        // Optional in-band FEC (FEC=1) with an expected packet loss in percent (LOSS=20). The
+        // bitrate is then the total of main and redundant parts, so it must be well above the
+        // reduced-rate thresholds for the main part to land under them.
+        let fec: i32 = std::env::var("FEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let loss: i32 = std::env::var("LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        check(opus_encoder_ctl(encoder.pointer.as_ptr(), 4012, fec), "fec")?;
+        check(opus_encoder_ctl(encoder.pointer.as_ptr(), 4014, loss), "loss")?;
         check(
             opus_decoder_ctl(decoder.pointer.as_ptr(), 4050, 1_i32),
             "decoder SMPL",

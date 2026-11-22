@@ -149,3 +149,48 @@ fixture comparison and all 131 MLOW tests passed in
 The generic decompiler and verified capture store passed independently in the
 [unwasm workflow](https://github.com/oxidezap/unwasm/actions/runs/33982898581)
 and [whatspec workflow](https://github.com/oxidezap/whatspec/actions/runs/33983145320).
+
+## Reduced-rate (TOC bit 2) vectors
+
+The decoder runs the reduced-rate geometry (two 160-sample subframes per 20 ms internal frame).
+Real calls reach it as soon as a call is switched from audio to video; the packets look like
+`0x54`, `0x16` and `0x94`. Steps to regenerate everything below are in
+`scripts/mlow-vectors/lowrate/README.md`. All of it comes from the synthetic `synth_mic.raw`.
+
+| File | Source | Used for |
+|---|---|---|
+| `lr_c_lr60_frames.json`, `lr_c_lr60_ref.raw` | C reference encoder at 8 kbps, 60 ms, and its decoder's PCM | `lowrate_tests` |
+| `lr_c_lr20_*`, `lr_c_lr120_*` | the same at 20 ms (10 kbps) and 120 ms (8.5 kbps) | `lowrate_tests` |
+| `lr_c_lr60_params.json` | the symbols the C decoder read from those 330 internal frames, and its reconstructed LSFs | `smpl_lowrate` parameter test |
+| `lr_c_lr60_yhp.f32` | the C decoder's per-frame synthesis output (after tilt and HP filters) | `smpl_lowrate` synthesis test |
+| `lr_wasm_lr60_frames.json`, `lr_wasm_lr60_ref.raw` | the shipped module's encoder at `SET_BITRATE` 8000, 60 ms, and its decoder's PCM | `lowrate_tests` |
+| `lr_wasm_lr60_6k_*`, `lr_wasm_lr120_*` | the same at 6000 bps, and at 8500 bps with 120 ms packets | `lowrate_tests` |
+| `lr_c_fec{20,60,120}_*` | the C reference with in-band FEC on and 20 % expected loss, total bitrate 14-16 kbps (main part under the reduced-rate threshold): TOCs `0x56`/`0x4e`/`0x5e` next to the others | `lowrate_tests` |
+| `lr_wasm_fec{60,120}_*` | the shipped module's encoder with `OPUS_SET_INBAND_FEC` and `OPUS_SET_PACKET_LOSS_PERC` (4012, 4014) the same way | `lowrate_tests` |
+
+Two independent decoders therefore agree with this one on reduced-rate packets: the C reference
+(`84b076e0`) and the shipped module (`JgwtTQVeWPm`). Against both, the full-stream correlation is
+0.9998 and the SNR 31 to 37 dB, which is the same floor the full-rate path shows against the same
+two references (34.9 to 37.5 dB). The per-frame floor is a few percent of peak amplitude and is the
+port's float math against the references', not a reduced-rate effect.
+
+What these do not establish:
+
+- No packet captured from a phone is in the corpus. The encoders ran on synthetic input at
+  6 to 10 kbps (14-16 kbps total with FEC); a phone in a video call may use settings the corpus
+  never reaches (a bitrate change inside a call, different DTX behaviour).
+- FEC is stepped over, not used: a packet with VAD and TOC bit 1 set has the previous frames'
+  redundant copy in front of its own, and the low-rate path reads and discards it to reach the main
+  frames. Both references decode the main frames the same way. The full-rate path does not step
+  over it, which was left as it was and not tested.
+- Coded-inactive packets (`0x14`) and comfort-noise packets decode, but their audio is not
+  compared tightly: the references add comfort noise there and this decoder does not, same as at the
+  full rate. They are quiet.
+- The reconstructed lowest LSF of an unvoiced or inactive frame can differ from the C reference by
+  up to 1.6e-3 radians when the minimum-spacing clamp triggers. This decoder follows the shipped
+  module's table selection there, which is swapped against the reference's voiced/unvoiced naming,
+  and PCM agreement against the shipped module is the same to four decimals with either selection.
+  It is not resolved which one the shipped module uses for unvoiced frames.
+- The two-subframe unvoiced codebooks (`smpl_lowrate.rs`) are transcribed from the C reference
+  source. They are confirmed indirectly: every unvoiced frame in the vendor-encoded stream parses
+  to its exact end, which a wrong table would not do.

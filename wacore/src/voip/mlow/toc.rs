@@ -25,7 +25,7 @@ pub(crate) struct MlowToc {
     /// The frame is coded as active voice, which gates two symbols in the LSF decode. NOT a claim
     /// that the frame has audio: a frame coded inactive still carries a decodable body.
     pub active: bool,
-    /// The reduced-rate geometry (2x160 internal frames), which this decoder does not implement.
+    /// The reduced-rate geometry: two 160-sample subframes per 20 ms internal frame, not four of 80.
     pub low_rate: bool,
     pub stereo: bool,
 }

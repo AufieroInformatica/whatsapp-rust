@@ -243,14 +243,17 @@ mod tests {
 
     // The proof that the cross-check cannot promote a packet the MLow decoder is decoding today.
     //
-    // A frame MLow currently accepts has bits 4:3 = 10 (60 ms), bit 5 = 0 (16 kHz), bit 2 = 0
-    // (low_rate) and bit 7 = 0 (not SID), which is exactly {0x10..=0x13, 0x50..=0x53}. Read as an
-    // Opus TOC each of those is config 2 or 10, both 40 ms, so every reachable duration is a
-    // multiple of 640 samples at 16 kHz. The stream's timestamp step is 960, and 960 is not a
-    // multiple of 640, so no body of any length can make the two agree.
+    // A frame MLow currently accepts has bits 4:3 = 10 (60 ms), bit 5 = 0 (16 kHz) and bit 7 = 0
+    // (not SID), which is exactly {0x10..=0x17, 0x50..=0x57} (bit 2 is the low-rate flag, which the
+    // decoder runs both ways). Read as an Opus TOC each of those is config 2 or 10, both 40 ms, so
+    // every reachable duration is a multiple of 640 samples at 16 kHz. The stream's timestamp step
+    // is 960, and 960 is not a multiple of 640, so no body of any length can make the two agree.
     #[test]
     fn no_packet_the_mlow_decoder_accepts_can_be_mistaken_for_a_960_sample_opus_packet() {
-        for toc in [0x10u8, 0x11, 0x12, 0x13, 0x50, 0x51, 0x52, 0x53] {
+        for toc in [
+            0x10u8, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55,
+            0x56, 0x57,
+        ] {
             for len in 1..400usize {
                 let packet: Vec<u8> = core::iter::once(toc)
                     .chain((0..len).map(|i| (i % 251) as u8))
